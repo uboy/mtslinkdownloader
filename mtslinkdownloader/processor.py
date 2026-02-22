@@ -68,6 +68,16 @@ def _get_ffprobe():
     raise FileNotFoundError('ffprobe not found. Install ffmpeg with ffprobe on your system PATH.')
 
 
+def _check_nvenc_support() -> bool:
+    """Check if ffmpeg supports h264_nvenc hardware acceleration."""
+    ffmpeg = _get_ffmpeg()
+    try:
+        result = subprocess.run([ffmpeg, '-encoders'], capture_output=True, text=True)
+        return 'h264_nvenc' in result.stdout
+    except Exception:
+        return False
+
+
 def _probe_media(file_path: str) -> dict:
     """Probe a media file for video/audio stream info and duration."""
     ffprobe = _get_ffprobe()
@@ -135,7 +145,7 @@ def _detect_black_video(file_path: str, duration: float) -> bool:
         return False
     ffmpeg = _get_ffmpeg()
     cmd = [
-        ffmpeg, '-i', file_path,
+        ffmpeg, '-threads', '2', '-i', file_path,
         '-vf', 'blackdetect=d=0.1:pix_th=0.10',
         '-an', '-f', 'null', '-'
     ]
@@ -162,7 +172,7 @@ def _detect_speech_intervals(file_path: str, duration: float) -> list:
         return []
     ffmpeg = _get_ffmpeg()
     cmd = [
-        ffmpeg, '-i', file_path,
+        ffmpeg, '-threads', '2', '-i', file_path,
         '-af', 'silencedetect=noise=-35dB:d=0.5',
         '-vn', '-f', 'null', '-'
     ]
@@ -479,8 +489,12 @@ def _download_and_probe_clip(clip: dict, directory: str, client) -> None:
         clip['speech_intervals'] = _detect_speech_intervals(file_path, clip['duration'])
 
 
-def download_and_probe_all(streams: dict, directory: str, max_workers: int = 4):
+def download_and_probe_all(streams: dict, directory: str, max_workers: int = None):
     """Download and probe all clips across all streams."""
+    if max_workers is None:
+        # Increase workers for multi-core systems (probing and downloading)
+        max_workers = min(os.cpu_count() or 4, 24)
+    
     all_clips = []
     for stream in streams.values():
         all_clips.extend(stream['clips'])
@@ -736,7 +750,7 @@ def compute_layout_timeline(streams: dict, total_duration: float,
 # ─── Step 4: Render composite segments ───────────────────────────────────
 
 def _render_segment(seg_index: int, segment: dict, streams: dict,
-                    tmpdir: str) -> str:
+                    tmpdir: str, threads: int = 1, use_nvenc: bool = False) -> str:
     """Render a single composite segment to a video file.
 
     Builds an ffmpeg command with filter_complex to overlay video streams
@@ -848,6 +862,7 @@ def _render_segment(seg_index: int, segment: dict, streams: dict,
     # No inputs at all → black + silence
     if input_idx == 0:
         _run_ffmpeg([
+            '-threads', str(threads),
             '-y',
             '-f', 'lavfi', '-i',
             f'color=black:s={OUTPUT_WIDTH}x{OUTPUT_HEIGHT}:r={OUTPUT_FPS}:d={duration:.3f}',
@@ -978,13 +993,21 @@ def _render_segment(seg_index: int, segment: dict, streams: dict,
     # Build complete command
     # Compute a generous timeout: 60s base + 30s per second of output
     ffmpeg_timeout = max(120, int(60 + duration * 30))
-    cmd = ['-y'] + inputs
+    
+    video_encoder = 'h264_nvenc' if use_nvenc else 'libx264'
+    encoder_preset = 'p1' if use_nvenc else 'ultrafast'  # p1 is fastest for nvenc
+
+    cmd = ['-threads', str(threads), '-y'] + inputs
     cmd += ['-filter_complex', filter_complex]
     cmd += ['-map', f'[{video_out_label}]']
     cmd += ['-map', audio_map]
     cmd += [
-        '-c:v', 'libx264', '-preset', 'ultrafast',
-        '-tune', 'zerolatency',
+        '-c:v', video_encoder, '-preset', encoder_preset
+    ]
+    if not use_nvenc:
+        cmd += ['-tune', 'zerolatency']
+    
+    cmd += [
         '-profile:v', 'high', '-level', '4.1',
         '-pix_fmt', 'yuv420p',
         '-g', '30',
@@ -1000,11 +1023,33 @@ def _render_segment(seg_index: int, segment: dict, streams: dict,
     return output_path
 
 
+
 def render_all_segments(timeline: list, streams: dict, tmpdir: str) -> list:
     """Render all composite segments in parallel."""
-    max_workers = min(os.cpu_count() or 4, 4)
+    cpu_count = os.cpu_count() or 4
+    use_nvenc = _check_nvenc_support()
+    
+    if use_nvenc:
+        # NVENC is very fast but usually has a limit on concurrent sessions (e.g. 3-8)
+        # We can run more segments in parallel but keep it reasonable
+        max_workers = min(cpu_count, 8)
+        threads_per_worker = max(1, cpu_count // max_workers)
+        logging.info(f'Hardware acceleration (NVENC) detected. Using {max_workers} workers.')
+    else:
+        # For CPU rendering, we want to balance parallel processes and threads per process.
+        # Too many parallel FFmpeg processes can cause memory issues and cache contention.
+        # A good balance for 64 cores: 16 workers with 4 threads each, or 8 with 8.
+        if cpu_count >= 32:
+            max_workers = 16
+        elif cpu_count >= 16:
+            max_workers = 8
+        else:
+            max_workers = min(cpu_count, 4)
+        
+        threads_per_worker = max(1, cpu_count // max_workers)
+        logging.info(f'CPU rendering. Using {max_workers} workers with {threads_per_worker} threads each.')
 
-    logging.info(f'Rendering {len(timeline)} segments with {max_workers} workers...')
+    logging.info(f'Rendering {len(timeline)} segments...')
 
     segment_files = [None] * len(timeline)
 
@@ -1012,7 +1057,8 @@ def render_all_segments(timeline: list, streams: dict, tmpdir: str) -> list:
         futures = {}
         for i, segment in enumerate(timeline):
             future = executor.submit(
-                _render_segment, i, segment, streams, tmpdir
+                _render_segment, i, segment, streams, tmpdir, 
+                threads=threads_per_worker, use_nvenc=use_nvenc
             )
             futures[future] = i
 
@@ -1177,12 +1223,15 @@ def process_composite_video(directory: str, json_data: dict,
 # ─── Legacy entry points (kept for backward compatibility) ───────────────
 
 def process_video_clips(directory: str, json_data: Dict,
-                        max_workers: int = 4) -> Tuple[float, List[dict], List[dict]]:
+                        max_workers: int = None) -> Tuple[float, List[dict], List[dict]]:
     """Legacy: Download clips and classify as video/audio.
 
     Preserved for backward compatibility. New code should use
     process_composite_video() instead.
     """
+    if max_workers is None:
+        max_workers = min(os.cpu_count() or 4, 16)
+    
     total_duration = float(json_data.get('duration', 0))
     if not total_duration:
         raise ValueError('Duration not found in JSON data.')
