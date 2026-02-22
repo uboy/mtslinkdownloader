@@ -467,6 +467,28 @@ def parse_presentation_timeline(json_data: dict) -> Tuple[List[str], List[Tuple[
 
 # ─── Step 2: Download and probe clips ────────────────────────────────────
 
+def _create_proxy_clip(file_path: str, threads: int = 2) -> str:
+    """Create a low-resolution proxy for a camera clip to speed up rendering."""
+    proxy_path = file_path.replace('.mp4', '_proxy.mp4')
+    if os.path.exists(proxy_path):
+        return proxy_path
+    
+    ffmpeg = _get_ffmpeg()
+    # Scale to max 320x240 (standard sidebar size)
+    cmd = [
+        ffmpeg, '-threads', str(threads), '-y', '-i', file_path,
+        '-vf', 'scale=320:240:force_original_aspect_ratio=decrease,pad=320:240:(ow-iw)/2:(oh-ih)/2:black,setsar=1',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+        '-c:a', 'copy', proxy_path
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, check=True, timeout=300)
+        return proxy_path
+    except Exception as e:
+        logging.warning(f'Failed to create proxy for {file_path}: {e}')
+        return file_path
+
+
 def _download_and_probe_clip(clip: dict, directory: str, client) -> None:
     """Download a single clip and probe its media info."""
     try:
@@ -488,18 +510,13 @@ def _download_and_probe_clip(clip: dict, directory: str, client) -> None:
     clip['has_audio'] = info['has_audio']
 
     if clip['duration'] <= 0:
-        logging.warning(
-            f'Media clip has zero or invalid duration: {file_path}. '
-            f'This may cause timing gaps in the final video.'
-        )
-    elif clip['duration'] < 0.5:
-        logging.warning(
-            f'Extremely short clip detected ({clip["duration"]:.3f}s): {file_path}. '
-            f'Check if this chunk is complete.'
-        )
+        logging.warning(f'Media clip has zero or invalid duration: {file_path}.')
+    
+    # POINT 4: Create proxy for camera clips to speed up main render
+    if clip['has_video'] and not clip.get('_is_screenshare'):
+        clip['proxy_path'] = _create_proxy_clip(file_path)
 
-    # Detect black-screen cameras and mark as no video
-    # Skip screenshare clips — presentations can have dark slides
+    # Detect black-screen cameras
     if clip['has_video'] and clip['duration'] > 0 and not clip.get('_is_screenshare'):
         if _detect_black_video(file_path, clip['duration']):
             logging.info(f'Black video detected, marking has_video=False: {file_path}')
@@ -687,11 +704,19 @@ def compute_layout_timeline(streams: dict, total_duration: float,
                 (sk, clip, seek) for sk, clip, seek in cameras
                 if _has_speech_at(speech_timelines.get(sk, []), t_mid)
             ]
-            # Always keep admin or at least 1 camera
+            # Always keep admin or at least 1 camera to avoid empty screen
             if not speaking:
-                # Keep the first camera (highest priority, likely admin)
-                speaking = cameras[:1]
+                # Find admin or first camera that actually has video
+                admin_cams = [c for c in cameras if streams[c[0]]['is_admin']]
+                speaking = admin_cams[:1] if admin_cams else cameras[:1]
             cameras = speaking
+
+        # FINAL FILTER: If a camera has no video AND no audio in this clip, 
+        # it's a "ghost" stream. Remove it to save FFmpeg resources.
+        cameras = [
+            (sk, clip, seek) for sk, clip, seek in cameras
+            if clip['has_video'] or clip['has_audio']
+        ]
 
         # Check for file-based presentation slide when no screenshare stream
         slide_image = None
@@ -839,7 +864,9 @@ def _render_segment(seg_index: int, segment: dict, streams: dict,
     visible_sks = set()
     for cam_i, (sk, clip, seek) in enumerate(visible_cameras):
         visible_sks.add(sk)
-        inputs.extend(['-ss', f'{seek:.3f}', '-t', f'{duration + 1.0:.3f}', '-i', clip['file_path']])
+        # POINT 4: Use pre-scaled proxy for camera inputs to speed up rendering
+        path = clip.get('proxy_path', clip['file_path'])
+        inputs.extend(['-ss', f'{seek:.3f}', '-t', f'{duration + 1.0:.3f}', '-i', path])
         video_roles.append((input_idx, f'cam_{cam_i}'))
         if clip['has_audio']:
             audio_indices.append(input_idx)
@@ -882,13 +909,35 @@ def _render_segment(seg_index: int, segment: dict, streams: dict,
     # Build filter_complex
     filter_parts = []
 
-    # Background canvas
-    filter_parts.append(
-        f'color=black:s={OUTPUT_WIDTH}x{OUTPUT_HEIGHT}:r={OUTPUT_FPS}:d={duration:.3f}[bg]'
-    )
-
-    current_layer = 'bg'
-    overlay_count = 0
+    # Optimization: if we have a screenshare/slide and NO other cameras,
+    # we can skip the black background and overlays entirely.
+    if has_screenshare and not visible_cameras:
+        if resolved_screenshare:
+            idx = 0 # screenshare is always first
+            filter_parts.append(
+                f'[{idx}:v]setpts=PTS-STARTPTS'
+                f',scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}'
+                f':force_original_aspect_ratio=decrease'
+                f',pad={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black'
+                f',setsar=1[v_out]'
+            )
+        elif slide_image:
+            idx = 0 # slide is always first
+            filter_parts.append(
+                f'[{idx}:v]scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}'
+                f':force_original_aspect_ratio=decrease'
+                f',pad={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black'
+                f',setsar=1[v_out]'
+            )
+        video_out_label = 'v_out'
+    else:
+        # Standard complex layout
+        filter_parts.append(
+            f'color=black:s={OUTPUT_WIDTH}x{OUTPUT_HEIGHT}:r={OUTPUT_FPS}:d={duration:.3f}[bg]'
+        )
+        current_layer = 'bg'
+        overlay_count = 0
+        # ... (the rest of existing overlay logic)
 
     if has_screenshare and (resolved_screenshare or slide_image):
         # ── Mode A: screenshare main + sidebar cameras ──
@@ -916,17 +965,11 @@ def _render_segment(seg_index: int, segment: dict, streams: dict,
         for idx, role in cam_roles:
             cam_num = int(role.split('_')[1])
             y_pos = cam_num * SIDEBAR_HEIGHT
-            label = f'sb{cam_num}'
-            filter_parts.append(
-                f'[{idx}:v]setpts=PTS-STARTPTS'
-                f',scale={SIDEBAR_WIDTH}:{SIDEBAR_HEIGHT}'
-                f':force_original_aspect_ratio=decrease'
-                f',pad={SIDEBAR_WIDTH}:{SIDEBAR_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black'
-                f',setsar=1[{label}]'
-            )
+            # Proxy is already scaled and padded to 320x240
+            # Just overlay it directly from the input
             next_layer = f'ol{overlay_count}'
             filter_parts.append(
-                f'[{current_layer}][{label}]overlay={MAIN_WIDTH}:{y_pos}'
+                f'[{current_layer}][{idx}:v]overlay={MAIN_WIDTH}:{y_pos}'
                 f':eof_action=repeat[{next_layer}]'
             )
             current_layer = next_layer
@@ -1002,9 +1045,13 @@ def _render_segment(seg_index: int, segment: dict, streams: dict,
     video_encoder = 'h264_nvenc' if use_nvenc else 'libx264'
     encoder_preset = 'p1' if use_nvenc else 'ultrafast'  # p1 is fastest for nvenc
 
+    # POINT 2: Optimization for blank/empty segments
+    # Use lowest possible bitrate/quality for segments with no screen/audio
+    is_minimal = not has_screenshare and not audio_indices
+    extra_args = ['-crf', '45'] if is_minimal and not use_nvenc else []
+
     # Add thread_queue_size for each input and use filter_threads
     optimized_inputs = []
-    # inputs is a list like ['-ss', '0.0', '-t', '10.0', '-i', 'path', ...]
     i = 0
     while i < len(inputs):
         if inputs[i] == '-i':
@@ -1023,9 +1070,10 @@ def _render_segment(seg_index: int, segment: dict, streams: dict,
     cmd += ['-map', audio_map]
     cmd += [
         '-c:v', video_encoder, '-preset', encoder_preset
-    ]
+    ] + extra_args
+    
     if not use_nvenc:
-        cmd += ['-tune', 'zerolatency']
+        cmd += ['-tune', 'stillimage' if is_minimal or not visible_cameras else 'zerolatency']
     
     cmd += [
         '-profile:v', 'high', '-level', '4.1',
@@ -1044,49 +1092,50 @@ def _render_segment(seg_index: int, segment: dict, streams: dict,
 
 
 def render_all_segments(timeline: list, streams: dict, tmpdir: str) -> list:
-    """Render all composite segments in parallel."""
+    """Render all composite segments in parallel with progress bar."""
+    import tqdm
     cpu_count = os.cpu_count() or 4
     use_nvenc = _check_nvenc_support()
     
     if use_nvenc:
-        # Even with NVENC, we can run more segments (up to 12)
         max_workers = min(cpu_count, 12)
         threads_per_worker = max(1, cpu_count // max_workers)
         logging.info(f'Hardware acceleration (NVENC) detected. Using {max_workers} workers.')
     else:
-        # Extreme parallelism for 64-core machines
+        # 32 workers is a sweet spot for 64-core systems to avoid IO/OS overhead
         if cpu_count >= 60:
-            max_workers = 40
+            max_workers = 32
         elif cpu_count >= 32:
             max_workers = 24
-        elif cpu_count >= 16:
-            max_workers = 12
         else:
-            max_workers = min(cpu_count, 4)
+            max_workers = min(cpu_count, 8)
         
-        threads_per_worker = max(1, cpu_count // max_workers)
+        threads_per_worker = max(2, cpu_count // max_workers)
         logging.info(f'CPU rendering. Using {max_workers} workers with {threads_per_worker} threads each.')
 
     logging.info(f'Rendering {len(timeline)} segments...')
 
     segment_files = [None] * len(timeline)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {}
-        for i, segment in enumerate(timeline):
-            future = executor.submit(
-                _render_segment, i, segment, streams, tmpdir, 
-                threads=threads_per_worker, use_nvenc=use_nvenc
-            )
-            futures[future] = i
+    with tqdm.tqdm(total=len(timeline), desc="Rendering segments", unit="seg") as pbar:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            for i, segment in enumerate(timeline):
+                future = executor.submit(
+                    _render_segment, i, segment, streams, tmpdir, 
+                    threads=threads_per_worker, use_nvenc=use_nvenc
+                )
+                futures[future] = i
 
-        for future in as_completed(futures):
-            idx = futures[future]
-            segment_files[idx] = future.result()
-            if (idx + 1) % 10 == 0 or idx + 1 == len(timeline):
-                logging.info(f'  Rendered segment {idx + 1}/{len(timeline)}')
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    segment_files[idx] = future.result()
+                except Exception as e:
+                    logging.error(f'Segment {idx} failed: {e}')
+                pbar.update(1)
 
-    return segment_files
+    return [f for f in segment_files if f is not None]
 
 
 # ─── Step 5: Final concat ────────────────────────────────────────────────
@@ -1229,6 +1278,22 @@ def process_composite_video(directory: str, json_data: dict,
     if not timeline:
         logging.error('No layout segments to render.')
         return
+
+    # Log activity stats
+    active_users = set()
+    total_speaking_time = 0
+    if hide_silent and speech_timelines:
+        for sk, intervals in speech_timelines.items():
+            if intervals:
+                active_users.add(streams[sk]['user_name'])
+                total_speaking_time += sum(end - start for start, end in intervals)
+        
+        logging.info(f'--- Activity Report ---')
+        logging.info(f'Active participants (with speech): {len(active_users)}')
+        if active_users:
+            logging.info(f'Users: {", ".join(list(active_users)[:10])}...')
+        logging.info(f'Estimated total speech duration: {total_speaking_time/60:.1f} minutes')
+        logging.info(f'-----------------------')
 
     # Step 4-5: Render segments and concat
     with tempfile.TemporaryDirectory() as tmpdir:
