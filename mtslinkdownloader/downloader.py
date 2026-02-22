@@ -56,26 +56,47 @@ def download_video_chunk(video_url: str, save_directory: str, client: Optional[h
     filename = os.path.basename(video_url)
     file_path = os.path.join(save_directory, filename)
 
-    if not os.path.exists(file_path):
-        owns_client = client is None
-        if owns_client:
-            client = httpx.Client(timeout=TIMEOUT_SETTINGS, limits=CONNECTION_LIMITS)
-        try:
-            with client.stream('GET', video_url) as response:
+    owns_client = client is None
+    if owns_client:
+        client = httpx.Client(timeout=TIMEOUT_SETTINGS, limits=CONNECTION_LIMITS)
+
+    try:
+        # Check if file exists and verify its size
+        if os.path.exists(file_path):
+            try:
+                # Use HEAD request to check remote file size without downloading
+                response = client.head(video_url)
                 response.raise_for_status()
-                total_size = int(response.headers.get('content-length', 0))
-                with open(file_path, 'wb') as file:
-                    with tqdm.tqdm(total=total_size, unit='B', unit_scale=True,
-                                   desc=f'Downloading {filename}') as progress:
-                        for chunk in response.iter_bytes(chunk_size=262144):
-                            file.write(chunk)
-                            progress.update(len(chunk))
-        except Exception:
-            # Clean up partial file on failure
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            raise
-        finally:
-            if owns_client:
-                client.close()
+                remote_size = int(response.headers.get('content-length', 0))
+                local_size = os.path.getsize(file_path)
+                
+                if remote_size > 0 and local_size == remote_size:
+                    return file_path
+                
+                logging.warning(
+                    f'Size mismatch for {filename}: local {local_size} vs remote {remote_size}. '
+                    f'Redownloading...'
+                )
+            except Exception as e:
+                logging.warning(f'Could not verify size for {filename}, skipping check: {e}')
+                return file_path
+
+        # If we get here, we need to download (or redownload)
+        with client.stream('GET', video_url) as response:
+            response.raise_for_status()
+            total_size = int(response.headers.get('content-length', 0))
+            with open(file_path, 'wb') as file:
+                with tqdm.tqdm(total=total_size, unit='B', unit_scale=True,
+                               desc=f'Downloading {filename}') as progress:
+                    for chunk in response.iter_bytes(chunk_size=262144):
+                        file.write(chunk)
+                        progress.update(len(chunk))
+    except Exception:
+        # Clean up partial file on failure
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise
+    finally:
+        if owns_client:
+            client.close()
     return file_path

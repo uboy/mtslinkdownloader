@@ -467,8 +467,16 @@ def parse_presentation_timeline(json_data: dict) -> Tuple[List[str], List[Tuple[
 
 def _download_and_probe_clip(clip: dict, directory: str, client) -> None:
     """Download a single clip and probe its media info."""
-    file_path = download_video_chunk(clip['url'], directory, client=client)
-    clip['file_path'] = file_path
+    try:
+        file_path = download_video_chunk(clip['url'], directory, client=client)
+        clip['file_path'] = file_path
+    except Exception as e:
+        logging.error(f'Critical failure downloading {clip["url"]}: {e}')
+        return
+
+    if not os.path.exists(file_path):
+        logging.error(f'File {file_path} missing after download attempt.')
+        return
 
     info = _probe_media(file_path)
     clip['duration'] = info['duration']
@@ -476,6 +484,17 @@ def _download_and_probe_clip(clip: dict, directory: str, client) -> None:
     clip['height'] = info['height']
     clip['has_video'] = info['has_video']
     clip['has_audio'] = info['has_audio']
+
+    if clip['duration'] <= 0:
+        logging.warning(
+            f'Media clip has zero or invalid duration: {file_path}. '
+            f'This may cause timing gaps in the final video.'
+        )
+    elif clip['duration'] < 0.5:
+        logging.warning(
+            f'Extremely short clip detected ({clip["duration"]:.3f}s): {file_path}. '
+            f'Check if this chunk is complete.'
+        )
 
     # Detect black-screen cameras and mark as no video
     # Skip screenshare clips — presentations can have dark slides
@@ -635,7 +654,8 @@ def compute_layout_timeline(streams: dict, total_duration: float,
         if t_start >= total_duration:
             break
         t_end = min(t_end, total_duration)
-        if t_end - t_start < 0.05:
+        duration = t_end - t_start
+        if duration < 0.05:
             continue
 
         t_mid = (t_start + t_end) / 2
@@ -687,29 +707,11 @@ def compute_layout_timeline(streams: dict, total_duration: float,
             'slide_image': slide_image,
         })
 
-    # Filter out empty segments — require at least one clip with actual video or audio.
-    # We keep audio-only segments because we don't want to lose conversation.
-    def _seg_has_content(seg):
-        if seg['screenshare']:
-            _, clip, _ = seg['screenshare']
-            if clip['has_video'] or clip['has_audio']:
-                return True
-        if seg.get('slide_image'):
-            return True
-        for _, clip, _ in seg['cameras']:
-            if clip['has_video'] or clip['has_audio']:
-                return True
-        return False
-
-    before_filter = len(segments)
-    segments = [seg for seg in segments if _seg_has_content(seg)]
-    if before_filter != len(segments):
-        logging.info(f'Filtered {before_filter - len(segments)} empty segments (no video/audio)')
-
-    # Merge consecutive segments with identical active stream set
     if not segments:
         return segments
 
+    # Merge consecutive segments with identical active stream set
+    # ONLY if they are contiguous in time to avoid "stretching" clips over gaps
     def _stream_set(seg):
         keys = set()
         if seg['screenshare']:
@@ -717,7 +719,6 @@ def compute_layout_timeline(streams: dict, total_duration: float,
             keys.add((sk, clip.get('file_path')))
         for sk, clip, _ in seg['cameras']:
             keys.add((sk, clip.get('file_path')))
-        # Include slide_image so different slides produce different segments
         slide = seg.get('slide_image')
         if slide:
             keys.add(('slide', slide))
@@ -726,7 +727,9 @@ def compute_layout_timeline(streams: dict, total_duration: float,
     merged = [segments[0]]
     for seg in segments[1:]:
         prev = merged[-1]
-        if _stream_set(prev) == _stream_set(seg):
+        # Check for matching stream set AND strict temporal continuity
+        if (abs(prev['end'] - seg['start']) < 0.001 and 
+            _stream_set(prev) == _stream_set(seg)):
             prev['end'] = seg['end']
         else:
             merged.append(seg)
@@ -868,8 +871,8 @@ def _render_segment(seg_index: int, segment: dict, streams: dict,
             f'color=black:s={OUTPUT_WIDTH}x{OUTPUT_HEIGHT}:r={OUTPUT_FPS}:d={duration:.3f}',
             '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
             '-t', f'{duration:.3f}',
-            '-c:v', 'libx264', '-preset', 'ultrafast',
-            '-c:a', 'aac', '-shortest',
+            '-c:v', video_encoder, '-preset', encoder_preset,
+            '-c:a', 'aac',
             output_path
         ], desc=f'black seg {seg_index}')
         return output_path
@@ -900,7 +903,7 @@ def _render_segment(seg_index: int, segment: dict, streams: dict,
             next_layer = f'ol{overlay_count}'
             filter_parts.append(
                 f'[{current_layer}][main_v]overlay=0:0'
-                f':eof_action=pass[{next_layer}]'
+                f':eof_action=repeat[{next_layer}]'
             )
             current_layer = next_layer
             overlay_count += 1
@@ -1013,7 +1016,6 @@ def _render_segment(seg_index: int, segment: dict, streams: dict,
         '-g', '30',
         '-r', str(OUTPUT_FPS),
         '-c:a', 'aac', '-ar', '44100', '-ac', '2',
-        '-shortest',
         '-t', f'{duration:.3f}',
         output_path
     ]
