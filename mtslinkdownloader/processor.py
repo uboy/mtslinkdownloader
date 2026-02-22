@@ -135,6 +135,10 @@ def _run_ffmpeg(args: list, desc: str = "", timeout: int = None):
         logging.error(f'ffmpeg timed out ({desc}) after {timeout}s')
         raise RuntimeError(f'ffmpeg timed out ({desc})')
     if result.returncode != 0:
+        # Check if the process was interrupted by user (signal 2 or exit code 130)
+        if result.returncode in (2, 130, -2):
+            raise RuntimeError('ffmpeg interrupted by user')
+            
         logging.error(f'ffmpeg stderr ({desc}): {result.stderr[-1000:]}')
         raise RuntimeError(f'ffmpeg failed ({desc}): {result.stderr[-500:]}')
 
@@ -794,25 +798,157 @@ def compute_layout_timeline(streams: dict, total_duration: float,
 
 # ─── Step 4: Render composite segments ───────────────────────────────────
 
+class TqdmLoggingHandler(logging.Handler):
+    """Handler that redirects logging to tqdm.write to avoid breaking progress bars."""
+    def emit(self, record):
+        try:
+            import tqdm
+            msg = self.format(record)
+            tqdm.tqdm.write(msg)
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
 def _render_segment(seg_index: int, segment: dict, streams: dict,
                     tmpdir: str, threads: int = 1, use_nvenc: bool = False) -> str:
-    """Render a single composite segment to a video file.
-
-    Builds an ffmpeg command with filter_complex to overlay video streams
-    and mix audio streams.
-    """
+    """Render a single composite segment to a video file."""
     output_path = os.path.join(tmpdir, f'seg_{seg_index:05d}.mp4')
     t_start = segment['start']
     duration = segment['end'] - segment['start']
     
-    # Define encoder settings early to avoid UnboundLocalError
     video_encoder = 'h264_nvenc' if use_nvenc else 'libx264'
     encoder_preset = 'p1' if use_nvenc else 'ultrafast'
 
-    screenshare = segment['screenshare']  # (stream_key, clip, seek) or None
-    cameras = segment['cameras']          # [(stream_key, clip, seek), ...]
-
+    screenshare = segment['screenshare']
+    cameras = segment['cameras']
     has_screenshare = screenshare is not None
+    slide_image = segment.get('slide_image')
+
+    resolved_screenshare = None
+    if screenshare:
+        sk = screenshare[0]
+        clip, seek = _find_clip_at_time(streams[sk], t_start)
+        if clip: resolved_screenshare = (sk, clip, seek)
+
+    resolved_cameras = []
+    for sk, _, _ in cameras:
+        clip, seek = _find_clip_at_time(streams[sk], t_start)
+        if clip: resolved_cameras.append((sk, clip, seek))
+
+    if not resolved_screenshare and slide_image and os.path.exists(slide_image):
+        has_screenshare = True
+
+    if has_screenshare and (resolved_screenshare or slide_image):
+        visible_cameras = [ (sk, c, s) for sk, c, s in resolved_cameras if c['has_video'] ][:MAX_SIDEBAR_CAMS]
+    else:
+        visible_cameras = [ (sk, c, s) for sk, c, s in resolved_cameras if c['has_video'] ][:9]
+
+    inputs = []
+    video_roles = []
+    audio_indices = []
+    input_idx = 0
+
+    if resolved_screenshare:
+        sk, clip, seek = resolved_screenshare
+        inputs.extend(['-ss', f'{seek:.3f}', '-t', f'{duration + 1.0:.3f}', '-i', clip['file_path']])
+        if clip['has_video']: video_roles.append((input_idx, 'main'))
+        if clip['has_audio']: audio_indices.append(input_idx)
+        input_idx += 1
+    elif slide_image and has_screenshare:
+        inputs.extend(['-loop', '1', '-framerate', str(OUTPUT_FPS), '-t', f'{duration:.3f}', '-i', slide_image])
+        video_roles.append((input_idx, 'main'))
+        input_idx += 1
+
+    visible_sks = set()
+    for cam_i, (sk, clip, seek) in enumerate(visible_cameras):
+        visible_sks.add(sk)
+        path = clip.get('proxy_path', clip['file_path'])
+        inputs.extend(['-ss', f'{seek:.3f}', '-t', f'{duration + 1.0:.3f}', '-i', path])
+        video_roles.append((input_idx, f'cam_{cam_i}'))
+        if clip['has_audio']: audio_indices.append(input_idx)
+        input_idx += 1
+
+    MAX_AUDIO_ONLY_INPUTS = 6
+    if resolved_screenshare: visible_sks.add(resolved_screenshare[0])
+    audio_only_added = 0
+    for sk, clip, seek in resolved_cameras:
+        if sk in visible_sks: continue
+        if not clip['has_audio']: continue
+        if audio_only_added >= MAX_AUDIO_ONLY_INPUTS: break
+        inputs.extend(['-ss', f'{seek:.3f}', '-t', f'{duration + 1.0:.3f}', '-i', clip['file_path']])
+        audio_indices.append(input_idx)
+        input_idx += 1
+        audio_only_added += 1
+
+    if input_idx == 0:
+        _run_ffmpeg(['-threads', str(threads), '-y', '-f', 'lavfi', '-i', f'color=black:s={OUTPUT_WIDTH}x{OUTPUT_HEIGHT}:r={OUTPUT_FPS}:d={duration:.3f}', '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo', '-t', f'{duration:.3f}', '-c:v', video_encoder, '-preset', encoder_preset, '-c:a', 'aac', output_path], desc=f'black seg {seg_index}')
+        return output_path
+
+    # Simple, reliable filter chain
+    filter_parts = []
+    filter_parts.append(f'color=black:s={OUTPUT_WIDTH}x{OUTPUT_HEIGHT}:r={OUTPUT_FPS}:d={duration:.3f}[bg]')
+    current_layer = 'bg'
+    overlay_count = 0
+    
+    # 1. Screen layer
+    main_inputs = [idx for idx, role in video_roles if role == 'main']
+    if main_inputs:
+        idx = main_inputs[0]
+        # Skip pts for slide images
+        pts_filter = 'setpts=PTS-STARTPTS,' if not (slide_image and not resolved_screenshare and idx == 0) else ''
+        filter_parts.append(f'[{idx}:v]{pts_filter}scale={MAIN_WIDTH}:{MAIN_HEIGHT}:force_original_aspect_ratio=decrease,pad={MAIN_WIDTH}:{MAIN_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[main_v]')
+        next_layer = f'ol{overlay_count}'
+        filter_parts.append(f'[{current_layer}][main_v]overlay=0:0:eof_action=repeat[{next_layer}]')
+        current_layer = next_layer
+        overlay_count += 1
+
+    # 2. Sidebar camera layers (pre-scaled via proxy)
+    cam_roles = [(idx, role) for idx, role in video_roles if role.startswith('cam_')]
+    for idx, role in cam_roles:
+        cam_num = int(role.split('_')[1]); y_pos = cam_num * SIDEBAR_HEIGHT
+        next_layer = f'ol{overlay_count}'
+        filter_parts.append(f'[{current_layer}][{idx}:v]overlay={MAIN_WIDTH}:{y_pos}:eof_action=repeat[{next_layer}]')
+        current_layer = next_layer
+        overlay_count += 1
+
+    # 3. Audio layers
+    audio_map = '[aout]'
+    if len(audio_indices) > 1:
+        padded_labels = []
+        for ai, idx in enumerate(audio_indices):
+            label = f'apad{ai}'; filter_parts.append(f'[{idx}:a]asetpts=PTS-STARTPTS,aresample=44100,apad=whole_dur={duration:.3f}[{label}]')
+            padded_labels.append(f'[{label}]')
+        filter_parts.append(f'{"".join(padded_labels)}amix=inputs={len(audio_indices)}:duration=first:dropout_transition=0:normalize=1[aout]')
+    elif len(audio_indices) == 1:
+        filter_parts.append(f'[{audio_indices[0]}:a]asetpts=PTS-STARTPTS,aresample=44100,apad=whole_dur={duration:.3f}[aout]')
+    else:
+        filter_parts.append(f'anullsrc=r=44100:cl=stereo:d={duration:.3f}[aout]')
+
+    filter_complex = ';'.join(filter_parts)
+    is_minimal = not has_screenshare and not audio_indices
+    extra_args = ['-crf', '45'] if is_minimal and not use_nvenc else []
+
+    optimized_inputs = []
+    i = 0
+    while i < len(inputs):
+        if inputs[i] == '-i':
+            optimized_inputs.extend(['-thread_queue_size', '1024', '-i', inputs[i+1]])
+            i += 2
+        elif inputs[i] in ('-ss', '-t', '-loop', '-framerate'):
+            optimized_inputs.extend([inputs[i], inputs[i+1]])
+            i += 2
+        else:
+            optimized_inputs.append(inputs[i]); i += 1
+
+    cmd = ['-threads', str(threads), '-filter_threads', str(threads), '-y'] + optimized_inputs
+    cmd += ['-filter_complex', filter_complex, '-map', f'[{current_layer}]', '-map', audio_map]
+    cmd += ['-c:v', video_encoder, '-preset', encoder_preset] + extra_args
+    if not use_nvenc:
+        cmd += ['-tune', 'stillimage' if is_minimal or not visible_cameras else 'zerolatency']
+    cmd += ['-profile:v', 'high', '-level', '4.1', '-pix_fmt', 'yuv420p', '-g', '30', '-r', str(OUTPUT_FPS), '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-t', f'{duration:.3f}', output_path]
+    
+    _run_ffmpeg(cmd, desc=f'segment {seg_index} ({duration:.1f}s)', timeout=max(120, int(60 + duration * 30)))
+    return output_path
 
     # Re-resolve clips at segment start time (important for merged segments)
     resolved_screenshare = None
@@ -1139,30 +1275,43 @@ def render_all_segments(timeline: list, streams: dict, tmpdir: str) -> list:
 
     segment_files = [None] * len(timeline)
 
-    with tqdm.tqdm(total=len(timeline), desc="Rendering segments", unit="seg") as pbar:
-        executor = ThreadPoolExecutor(max_workers=max_workers)
-        try:
-            futures = {}
-            for i, segment in enumerate(timeline):
-                future = executor.submit(
-                    _render_segment, i, segment, streams, tmpdir, 
-                    threads=threads_per_worker, use_nvenc=use_nvenc
-                )
-                futures[future] = i
+    # Redirect logging to tqdm during rendering to keep progress bar clean
+    tqdm_handler = TqdmLoggingHandler()
+    tqdm_handler.setFormatter(logging.Formatter('%d.%m.%Y %H:%M:%S [%(levelname)s]: %(message)s'))
+    root_logger = logging.getLogger()
+    old_handlers = root_logger.handlers[:]
+    root_logger.handlers = [tqdm_handler]
 
-            for future in as_completed(futures):
-                idx = futures[future]
-                try:
-                    segment_files[idx] = future.result()
-                except Exception as e:
-                    logging.error(f'Segment {idx} failed: {e}')
-                pbar.update(1)
-        except KeyboardInterrupt:
-            logging.info("Stopping rendering...")
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        finally:
-            executor.shutdown(wait=True)
+    try:
+        with tqdm.tqdm(total=len(timeline), desc="Rendering segments", unit="seg") as pbar:
+            executor = ThreadPoolExecutor(max_workers=max_workers)
+            try:
+                futures = {}
+                for i, segment in enumerate(timeline):
+                    future = executor.submit(
+                        _render_segment, i, segment, streams, tmpdir, 
+                        threads=threads_per_worker, use_nvenc=use_nvenc
+                    )
+                    futures[future] = i
+
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    try:
+                        segment_files[idx] = future.result()
+                    except (RuntimeError, Exception) as e:
+                        # Skip logging if the error was clearly caused by an interrupt
+                        if "interrupted" not in str(e).lower():
+                            logging.error(f'Segment {idx} failed: {e}')
+                    pbar.update(1)
+            except KeyboardInterrupt:
+                logging.info("Stopping rendering...")
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            finally:
+                executor.shutdown(wait=True)
+    finally:
+        # Restore original log handlers
+        root_logger.handlers = old_handlers
 
     return [f for f in segment_files if f is not None]
 
