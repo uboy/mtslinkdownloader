@@ -1,0 +1,8 @@
+services:
+  mtslinkdownloader:
+    build: .
+    container_name: mtslinkdownloader
+    volumes:
+      - .:/app
+    # Пример запуска с URL (можно переопределить при вызове)
+    command: ["https://my.mts-link.ru/12345678/987654321/record-new/123456789/record-file/1234567890", "--session-id", "a1b2c3d4"]

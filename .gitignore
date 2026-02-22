@@ -1,0 +1,10 @@
+*/
+*.log
+*.mp4
+*.mp3
+!docs
+!mtslinkdownloader
+!tests
+!get_sessionId.mp4
+!LICENSE
+!setup.py
