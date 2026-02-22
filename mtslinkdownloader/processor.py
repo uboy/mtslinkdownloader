@@ -144,8 +144,10 @@ def _detect_black_video(file_path: str, duration: float) -> bool:
     if duration <= 0:
         return False
     ffmpeg = _get_ffmpeg()
+    # Only check the first 30 seconds to speed up the process
+    check_duration = min(duration, 30.0)
     cmd = [
-        ffmpeg, '-threads', '2', '-i', file_path,
+        ffmpeg, '-threads', '2', '-t', str(check_duration), '-i', file_path,
         '-vf', 'blackdetect=d=0.1:pix_th=0.10',
         '-an', '-f', 'null', '-'
     ]
@@ -511,8 +513,8 @@ def _download_and_probe_clip(clip: dict, directory: str, client) -> None:
 def download_and_probe_all(streams: dict, directory: str, max_workers: int = None):
     """Download and probe all clips across all streams."""
     if max_workers is None:
-        # Increase workers for multi-core systems (probing and downloading)
-        max_workers = min(os.cpu_count() or 4, 24)
+        # High parallelism for 64-core systems
+        max_workers = min(os.cpu_count() or 4, 48)
     
     all_clips = []
     for stream in streams.values():
@@ -1000,7 +1002,22 @@ def _render_segment(seg_index: int, segment: dict, streams: dict,
     video_encoder = 'h264_nvenc' if use_nvenc else 'libx264'
     encoder_preset = 'p1' if use_nvenc else 'ultrafast'  # p1 is fastest for nvenc
 
-    cmd = ['-threads', str(threads), '-y'] + inputs
+    # Add thread_queue_size for each input and use filter_threads
+    optimized_inputs = []
+    # inputs is a list like ['-ss', '0.0', '-t', '10.0', '-i', 'path', ...]
+    i = 0
+    while i < len(inputs):
+        if inputs[i] == '-i':
+            optimized_inputs.extend(['-thread_queue_size', '1024', '-i', inputs[i+1]])
+            i += 2
+        elif inputs[i] in ('-ss', '-t', '-loop', '-framerate'):
+            optimized_inputs.extend([inputs[i], inputs[i+1]])
+            i += 2
+        else:
+            optimized_inputs.append(inputs[i])
+            i += 1
+
+    cmd = ['-threads', str(threads), '-filter_threads', str(threads), '-y'] + optimized_inputs
     cmd += ['-filter_complex', filter_complex]
     cmd += ['-map', f'[{video_out_label}]']
     cmd += ['-map', audio_map]
@@ -1032,19 +1049,18 @@ def render_all_segments(timeline: list, streams: dict, tmpdir: str) -> list:
     use_nvenc = _check_nvenc_support()
     
     if use_nvenc:
-        # NVENC is very fast but usually has a limit on concurrent sessions (e.g. 3-8)
-        # We can run more segments in parallel but keep it reasonable
-        max_workers = min(cpu_count, 8)
+        # Even with NVENC, we can run more segments (up to 12)
+        max_workers = min(cpu_count, 12)
         threads_per_worker = max(1, cpu_count // max_workers)
         logging.info(f'Hardware acceleration (NVENC) detected. Using {max_workers} workers.')
     else:
-        # For CPU rendering, we want to balance parallel processes and threads per process.
-        # Too many parallel FFmpeg processes can cause memory issues and cache contention.
-        # A good balance for 64 cores: 16 workers with 4 threads each, or 8 with 8.
-        if cpu_count >= 32:
-            max_workers = 16
+        # Extreme parallelism for 64-core machines
+        if cpu_count >= 60:
+            max_workers = 40
+        elif cpu_count >= 32:
+            max_workers = 24
         elif cpu_count >= 16:
-            max_workers = 8
+            max_workers = 12
         else:
             max_workers = min(cpu_count, 4)
         
