@@ -8,7 +8,7 @@ from typing import Optional
 
 # Pre-import to avoid issues
 from mtslinkdownloader.webinar import fetch_webinar_data
-from mtslinkdownloader.utils import get_base_path, create_directory_if_not_exists
+from mtslinkdownloader.utils import get_base_path, create_directory_if_not_exists, restore_terminal
 from mtslinkdownloader.cli import extract_ids_from_url
 from mtslinkdownloader.processor import process_composite_video, request_stop
 from mtslinkdownloader.downloader import construct_json_data_url, fetch_json_data
@@ -17,6 +17,10 @@ class TextRedirector:
     """Redirects stdout/stderr to a CTkTextbox with line-replacement support for tqdm."""
     def __init__(self, textbox):
         self.textbox = textbox
+
+    def isatty(self):
+        """Pretend to be a terminal for tqdm/logging compatibility."""
+        return False
 
     def write(self, s):
         if not s: return
@@ -65,26 +69,22 @@ class App(ctk.CTk):
         self.settings_frame.grid(row=3, column=0, padx=20, pady=10, sticky="ew")
         self.settings_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
-        # Session ID
         self.sid_label = ctk.CTkLabel(self.settings_frame, text="Session ID (Optional):")
         self.sid_label.grid(row=0, column=0, padx=10, pady=(5, 0), sticky="w")
         self.session_id = ctk.CTkEntry(self.settings_frame)
         self.session_id.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="ew")
 
-        # Start Time
         self.st_label = ctk.CTkLabel(self.settings_frame, text="Start offset (seconds):")
         self.st_label.grid(row=0, column=1, padx=10, pady=(5, 0), sticky="w")
         self.start_time = ctk.CTkEntry(self.settings_frame)
         self.start_time.insert(0, "0")
         self.start_time.grid(row=1, column=1, padx=10, pady=(0, 10), sticky="ew")
 
-        # Max duration
         self.dur_label = ctk.CTkLabel(self.settings_frame, text="Limit duration (seconds):")
         self.dur_label.grid(row=0, column=2, padx=10, pady=(5, 0), sticky="w")
         self.max_duration = ctk.CTkEntry(self.settings_frame)
         self.max_duration.grid(row=1, column=2, padx=10, pady=(0, 10), sticky="ew")
 
-        # Quality
         self.q_label = ctk.CTkLabel(self.settings_frame, text="Video Quality:")
         self.q_label.grid(row=0, column=3, padx=10, pady=(5, 0), sticky="w")
         self.quality_var = ctk.StringVar(value="FULL HD (1920x1080)")
@@ -99,7 +99,6 @@ class App(ctk.CTk):
                                 font=ctk.CTkFont(size=11, slant="italic"), text_color="gray")
         self.hint.grid(row=5, column=0, padx=20, pady=0)
 
-        # Control Buttons Frame
         self.btn_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.btn_frame.grid(row=6, column=0, padx=20, pady=15, sticky="ew")
         self.btn_frame.grid_columnconfigure((0, 1), weight=1)
@@ -196,8 +195,11 @@ class App(ctk.CTk):
         self.stop_btn.configure(state="disabled", text="STOP")
 
 def main():
-    app = App()
-    app.mainloop()
+    try:
+        app = App()
+        app.mainloop()
+    finally:
+        restore_terminal()
 
 if __name__ == "__main__":
     main()

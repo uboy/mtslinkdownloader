@@ -93,12 +93,14 @@ def _detect_black_video(file_path: str, duration: float) -> bool:
 
 def _detect_speech_intervals(file_path: str, duration: float) -> list:
     if duration <= 0 or STOP_REQUESTED: return []
-    cmd = [_get_ffmpeg(), '-threads', '2', '-i', file_path, '-af', 'silencedetect=noise=-35dB:d=0.5', '-vn', '-f', 'null', '-']
+    cmd = [_get_ffmpeg(), '-threads', '2', '-i', file_path, '-af', 'silencedetect=noise=-40dB:d=0.4', '-vn', '-f', 'null', '-']
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        silence = []; start = None
+        silence = []
+        start = None
         for line in result.stderr.splitlines():
-            m_s, m_e = re.search(r'silence_start:\s*([\d.]+)', line), re.search(r'silence_end:\s*([\d.]+)', line)
+            m_s = re.search(r'silence_start:\s*([\d.]+)', line)
+            m_e = re.search(r'silence_end:\s*([\d.]+)', line)
             if m_s: start = float(m_s.group(1))
             if m_e and start is not None: silence.append((start, float(m_e.group(1)))); start = None
         if start is not None: silence.append((start, duration))
@@ -138,7 +140,50 @@ def _create_proxy_clip(file_path: str, threads: int = 2) -> str:
         return proxy_path
     except Exception: return file_path
 
+def _create_name_placeholder(name: str, directory: str, w: int, h: int) -> str:
+    safe_name = name.replace("'", "").replace(":", "")
+    file_name = f"name_{abs(hash(safe_name))}.png"
+    path = os.path.join(directory, file_name)
+    if os.path.exists(path): return path
+    cmd = [_get_ffmpeg(), '-y', '-f', 'lavfi', '-i', f'color=c=gray:s={w}x{h}:d=1', '-vf', f"drawtext=text='{safe_name}':fontcolor=white:fontsize=20:x=(w-text_w)/2:y=(h-text_h)/2", '-frames:v', '1', path]
+    try:
+        subprocess.run(cmd, capture_output=True, check=True)
+        return path
+    except Exception: return None
+
 # ─── Parsing ─────────────────────────────────────────────────────────────
+
+def parse_chat_and_questions(json_data: dict) -> Tuple[list, list]:
+    event_logs = json_data.get('eventLogs', [])
+    chat, questions = [], []
+    for event in event_logs:
+        module, t, data = event.get('module', ''), event.get('relativeTime', 0), event.get('data', {})
+        if module == 'chat.add' and 'text' in data:
+            chat.append({'time': t, 'user': data.get('user', {}).get('nickname', 'System'), 'text': data['text'], 'type': 'CHAT'})
+        elif module == 'question.add' and 'text' in data:
+            questions.append({'time': t, 'user': data.get('user', {}).get('nickname', 'Anonymous'), 'text': data['text'], 'type': 'Q&A'})
+    return chat, questions
+
+def format_time_srt(seconds: float) -> str:
+    td = math.modf(seconds); ms = int(td[0] * 1000); s = int(td[1]); m, s = divmod(s, 60); h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+def export_chat_files(chat: list, questions: list, directory: str, base_name: str):
+    if not chat and not questions: return
+    txt_path = os.path.join(directory, f"{base_name}_log.txt")
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        if chat:
+            f.write("=== CHAT MESSAGES ===\n")
+            for m in chat: f.write(f"[{int(m['time'])}s] {m['user']}: {m['text']}\n")
+        if questions:
+            f.write("\n=== QUESTIONS ===\n")
+            for q in questions: f.write(f"[{int(q['time'])}s] {q['user']}: {q['text']}\n")
+    if chat:
+        srt_path = os.path.join(directory, f"{base_name}.srt")
+        with open(srt_path, 'w', encoding='utf-8') as f:
+            for i, m in enumerate(chat):
+                start = m['time']; end = start + 5.0
+                f.write(f"{i+1}\n{format_time_srt(start)} --> {format_time_srt(end)}\n{m['user']}: {m['text']}\n\n")
 
 def parse_event_logs(json_data: dict) -> Tuple[dict, Optional[int]]:
     event_logs = json_data.get('eventLogs', [])
@@ -211,13 +256,13 @@ def _reclassify_screenshare_by_dimensions(streams: dict):
         if new not in streams:
             s = streams[old]; s['is_screenshare'] = True; streams[new] = s; del streams[old]
 
-# ─── Processing ──────────────────────────────────────────────────────────
+# ─── Processing Logic ────────────────────────────────────────────────────
 
 class TqdmLoggingHandler(logging.Handler):
     def emit(self, record):
         try:
             msg = self.format(record)
-            if sys.stderr.isatty(): tqdm.tqdm.write(msg)
+            if hasattr(sys.stderr, 'isatty') and sys.stderr.isatty(): tqdm.tqdm.write(msg)
             else: print(msg, file=sys.stderr)
             self.flush()
         except Exception: self.handleError(record)
@@ -252,7 +297,7 @@ def download_and_probe_all(streams: dict, directory: str, max_workers: int = Non
                 futures = {executor.submit(_download_and_probe_clip, c, directory, client): c for c in all_clips}
                 for f in as_completed(futures):
                     if STOP_REQUESTED: executor.shutdown(wait=False, cancel_futures=True); break
-                    res = f.result(); 
+                    res = f.result()
                     if res: reports.append(res)
                     pbar.update(1)
             finally: executor.shutdown(wait=True)
@@ -287,9 +332,9 @@ def compute_layout_timeline(streams: dict, total_duration: float, admin_user_id:
             if clip: active.append((sk, clip, seek))
         screenshare = next((a for a in active if streams[a[0]]['is_screenshare']), None)
         cameras = [a for a in active if not streams[a[0]]['is_screenshare']]
-        if hide_silent and speech_timelines and cameras:
+        if hide_silent and speech_timelines:
             speaking = [c for c in cameras if _has_speech_at(speech_timelines.get(c[0], []), t_m)]
-            cameras = speaking if speaking else cameras[:1]
+            cameras = speaking
         cameras = [c for c in cameras if c[1]['has_video'] or c[1]['has_audio']]
         slide = next((path for s_s, s_e, path in (slide_timeline or []) if s_s <= t_m < s_e), None) if not screenshare else None
         segments.append({'start': t_s, 'end': t_e, 'screenshare': screenshare, 'cameras': cameras, 'slide_image': slide})
@@ -307,51 +352,81 @@ def compute_layout_timeline(streams: dict, total_duration: float, admin_user_id:
 
 def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str, 
                     threads: int = 1, encoder: str = 'libx264', preset: str = 'ultrafast',
-                    out_w: int = 1920, out_h: int = 1080) -> str:
+                    out_w: int = 1920, out_h: int = 1080, events: list = None) -> str:
     if STOP_REQUESTED: raise RuntimeError('interrupted')
     output_path = os.path.join(tmpdir, f'seg_{seg_index:05d}.mp4')
-    duration = segment['end'] - segment['start']
+    t_start, duration = segment['start'], segment['end'] - segment['start']
     inputs, v_inputs, a_inputs, cur_idx = [], [], [], 0
-    main_w = int(out_w * 0.8333); sidebar_w, sidebar_h = out_w - main_w, out_h // 4
+    main_w = (int(out_w * 0.8333) // 2) * 2; sidebar_w = out_w - main_w; sidebar_h = out_h // 4
     
     if segment['screenshare']:
-        sk, _, _ = segment['screenshare']; clip, seek = _find_clip_at_time(streams[sk], segment['start'])
+        sk, _, _ = segment['screenshare']
+        clip, seek = _find_clip_at_time(streams[sk], t_start)
         if clip:
             inputs.extend(['-ss', f'{seek:.3f}', '-t', f'{duration+1:.3f}', '-thread_queue_size', '1024', '-i', clip['file_path']])
-            if clip['has_video']: v_inputs.append((cur_idx, 'main'))
+            if clip['has_video']: v_inputs.append((cur_idx, 'main', None))
             if clip['has_audio']: a_inputs.append(cur_idx)
             cur_idx += 1
     elif segment.get('slide_image'):
         inputs.extend(['-loop', '1', '-framerate', str(OUTPUT_FPS), '-t', f'{duration:.3f}', '-i', segment['slide_image']])
-        v_inputs.append((cur_idx, 'main')); cur_idx += 1
+        v_inputs.append((cur_idx, 'main', None)); cur_idx += 1
+
     for sk, _, _ in segment['cameras']:
-        clip, seek = _find_clip_at_time(streams[sk], segment['start'])
-        if clip and (clip['has_video'] or clip['has_audio']):
+        clip, seek = _find_clip_at_time(streams[sk], t_start)
+        if not clip:
+            continue
+        user_name = streams[sk].get('user_name', 'User')
+        if clip['has_video']:
             path = clip.get('proxy_path', clip['file_path'])
             inputs.extend(['-ss', f'{seek:.3f}', '-t', f'{duration+1:.3f}', '-thread_queue_size', '1024', '-i', path])
-            if clip['has_video'] and len(v_inputs) < 5: v_inputs.append((cur_idx, 'cam'))
-            if clip['has_audio'] and len(a_inputs) < 8: a_inputs.append(cur_idx)
-            cur_idx += 1
+            if len(v_inputs) < 4: 
+                v_inputs.append((cur_idx, 'cam', user_name))
+                cur_idx += 1
+            if clip['has_audio'] and len(a_inputs) < 8: a_inputs.append(cur_idx - 1)
+        elif clip['has_audio']:
+            img_path = _create_name_placeholder(user_name, os.path.dirname(output_path), sidebar_w, sidebar_h)
+            if img_path:
+                inputs.extend(['-loop', '1', '-framerate', str(OUTPUT_FPS), '-t', f'{duration:.3f}', '-i', img_path])
+                if len(v_inputs) < 4: 
+                    v_inputs.append((cur_idx, 'main_no_pts', None))
+                    cur_idx += 1
+            inputs.extend(['-ss', f'{seek:.3f}', '-t', f'{duration+1:.3f}', '-thread_queue_size', '1024', '-i', clip['file_path']])
+            a_inputs.append(cur_idx); cur_idx += 1
+
     if not inputs:
         _run_ffmpeg(['-threads', str(threads), '-y', '-f', 'lavfi', '-i', f'color=black:s={out_w}x{out_h}:r={OUTPUT_FPS}:d={duration:.3f}', '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo', '-t', f'{duration:.3f}', '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', output_path], desc=f'black {seg_index}')
         return output_path
+
     filter_parts = [f'color=black:s={out_w}x{out_h}:r={OUTPUT_FPS}:d={duration:.3f}[bg]']
     curr_v, ov_idx, cam_count = 'bg', 0, 0
-    for idx, type in v_inputs:
+    for idx, type, name in v_inputs:
         if type == 'main':
             pts = 'setpts=PTS-STARTPTS,' if not (segment.get('slide_image') and not segment['screenshare']) else ''
-            filter_parts.append(f'[{idx}:v]{pts}scale={main_w}:{out_h}:force_original_aspect_ratio=decrease,pad={main_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[m_v]')
+            filter_parts.append(f'[{idx}:v]{pts}scale={main_w}:{out_h}:force_original_aspect_ratio=decrease,pad=max({main_w}\,iw):max({out_h}\,ih):(ow-iw)/2:(oh-ih)/2:black,setsar=1,scale={main_w}:{out_h}[m_v]')
             filter_parts.append(f'[{curr_v}][m_v]overlay=0:0:eof_action=repeat[v{ov_idx}]')
+        elif type == 'main_no_pts':
+            filter_parts.append(f'[{idx}:v]scale={sidebar_w}:{sidebar_h},setsar=1[c{idx}]')
+            filter_parts.append(f'[{curr_v}][c{idx}]overlay={main_w}:{cam_count*sidebar_h}:eof_action=repeat[v{ov_idx}]')
+            cam_count += 1
         else:
-            filter_parts.append(f'[{idx}:v]scale={sidebar_w}:{sidebar_h}:force_original_aspect_ratio=decrease,pad={sidebar_w}:{sidebar_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[c{idx}]')
+            filter_parts.append(f'[{idx}:v]scale={sidebar_w}:{sidebar_h}:force_original_aspect_ratio=decrease,pad=max({sidebar_w}\,iw):max({sidebar_h}\,ih):(ow-iw)/2:(oh-ih)/2:black,setsar=1,scale={sidebar_w}:{sidebar_h}[c{idx}]')
             filter_parts.append(f'[{curr_v}][c{idx}]overlay={main_w}:{cam_count*sidebar_h}:eof_action=repeat[v{ov_idx}]')
             cam_count += 1
         curr_v, ov_idx = f'v{ov_idx}', ov_idx + 1
+
+    msg = next((e for e in (events or []) if t_start <= e['time'] <= t_start + duration), None)
+    if msg:
+        txt = f"{msg['type']} | {msg['user']}\\: {msg['text'][:80].replace(':','').replace(chr(39),'')}"
+        filter_parts.append(f'color=black@0.6:s={sidebar_w}x{sidebar_h}:d={duration:.3f},drawtext=text=\'{txt}\':fontcolor=cyan:fontsize=14:x=10:y=(h-text_h)/2[chat]')
+        filter_parts.append(f'[{curr_v}][chat]overlay={main_w}:{3*sidebar_h}[v_fin]')
+        curr_v = 'v_fin'
+
     if a_inputs:
         for i, idx in enumerate(a_inputs): filter_parts.append(f'[{idx}:a]asetpts=PTS-STARTPTS,aresample=44100,apad=whole_dur={duration:.3f}[a{i}]')
         filter_parts.append(f'{"".join(f"[a{i}]" for i in range(len(a_inputs)))}amix=inputs={len(a_inputs)}:duration=first:dropout_transition=0:normalize=1[aout]')
         a_map = '[aout]'
     else: filter_parts.append(f'anullsrc=r=44100:cl=stereo:d={duration:.3f}[aout]'); a_map = '[aout]'
+
     is_min = not segment['screenshare'] and not a_inputs
     cmd = ['-threads', str(threads), '-filter_threads', str(threads), '-y'] + inputs
     cmd += ['-filter_complex', ';'.join(filter_parts), '-map', f'[{curr_v}]', '-map', a_map, '-c:v', encoder, '-preset', preset]
@@ -361,7 +436,7 @@ def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str,
     _run_ffmpeg(cmd, desc=f'seg {seg_index}', timeout=max(120, int(60+duration*30)))
     return output_path
 
-def render_all_segments(timeline: list, streams: dict, tmpdir: str, out_w: int = 1920, out_h: int = 1080) -> list:
+def render_all_segments(timeline: list, streams: dict, tmpdir: str, out_w: int = 1920, out_h: int = 1080, events: list = None) -> list:
     global STOP_REQUESTED
     encoder, preset, max_workers = _detect_best_encoder(); cpu_count = os.cpu_count() or 4
     threads_per_worker = max(2, cpu_count // max_workers); segment_files = [None] * len(timeline)
@@ -373,7 +448,7 @@ def render_all_segments(timeline: list, streams: dict, tmpdir: str, out_w: int =
         with tqdm.tqdm(**tqdm_args) as pbar:
             executor = ThreadPoolExecutor(max_workers=max_workers)
             try:
-                futures = {executor.submit(_render_segment, i, s, streams, tmpdir, threads_per_worker, encoder, preset, out_w, out_h): i for i, s in enumerate(timeline)}
+                futures = {executor.submit(_render_segment, i, s, streams, tmpdir, threads_per_worker, encoder, preset, out_w, out_h, events): i for i, s in enumerate(timeline)}
                 for f in as_completed(futures):
                     if STOP_REQUESTED: executor.shutdown(wait=False, cancel_futures=True); break
                     idx = futures[f]
@@ -388,8 +463,7 @@ def render_all_segments(timeline: list, streams: dict, tmpdir: str, out_w: int =
             finally: executor.shutdown(wait=True)
     finally: root_logger.removeHandler(tqdm_handler)
     if STOP_REQUESTED: raise RuntimeError("interrupted")
-    if None in segment_files: raise RuntimeError("Some segments failed. Aborted.")
-    return segment_files
+    return [f for f in segment_files if f]
 
 def concat_segments(segment_files: list, output_path: str):
     if STOP_REQUESTED: return
@@ -400,11 +474,14 @@ def concat_segments(segment_files: list, output_path: str):
 
 def process_composite_video(directory: str, json_data: dict, output_path: str, max_duration=None, hide_silent: bool = False, start_time: float = 0, quality: str = "1080p"):
     global STOP_REQUESTED
-    STOP_REQUESTED = False # Reset on new start
+    STOP_REQUESTED = False 
     res_map = {"1080p": (1920, 1080), "720p": (1280, 720)}
     out_w, out_h = res_map.get(quality, (1920, 1080))
     total_duration = float(json_data.get('duration', 0))
     if max_duration: total_duration = min(total_duration, start_time + max_duration)
+    chat, questions = parse_chat_and_questions(json_data)
+    all_events = sorted(chat + questions, key=lambda x: x['time'])
+    export_chat_files(chat, questions, directory, os.path.basename(output_path).replace('.mp4', ''))
     streams, admin_id = parse_event_logs(json_data)
     if not streams: return
     for s in streams.values():
@@ -432,9 +509,9 @@ def process_composite_video(directory: str, json_data: dict, output_path: str, m
     if not timeline: return
     if hide_silent:
         active = {streams[sk]['user_name'] for sk, t in speech_timelines.items() if t}
-        logging.info(f'Active participants: {len(active)} ({", ".join(list(active)[:5])}...)')
+        logging.info(f'Active participants (with speech): {len(active)}')
     with tempfile.TemporaryDirectory() as tmp:
-        files = render_all_segments(timeline, streams, tmp, out_w, out_h)
+        files = render_all_segments(timeline, streams, tmp, out_w, out_h, events=all_events)
         if files: concat_segments(files, output_path)
     logging.info(f'Done: {output_path}')
 
