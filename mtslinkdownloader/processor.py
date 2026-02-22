@@ -528,7 +528,8 @@ def _download_and_probe_clip(clip: dict, directory: str, client) -> None:
 
 
 def download_and_probe_all(streams: dict, directory: str, max_workers: int = None):
-    """Download and probe all clips across all streams."""
+    """Download and probe all clips across all streams with progress bars."""
+    import tqdm
     if max_workers is None:
         # High parallelism for 64-core systems
         max_workers = min(os.cpu_count() or 4, 48)
@@ -540,17 +541,31 @@ def download_and_probe_all(streams: dict, directory: str, max_workers: int = Non
     logging.info(f'Downloading and probing {len(all_clips)} clips with {max_workers} workers...')
 
     with create_shared_client() as client:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(_download_and_probe_clip, clip, directory, client): clip
-                for clip in all_clips
-            }
-            done = 0
-            for future in as_completed(futures):
-                future.result()
-                done += 1
-                if done % 20 == 0:
-                    logging.info(f'  Downloaded/probed {done}/{len(all_clips)} clips')
+        with tqdm.tqdm(total=len(all_clips), desc="Downloading/Probing", unit="file") as pbar:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(_download_and_probe_clip, clip, directory, client): clip
+                    for clip in all_clips
+                }
+                for future in as_completed(futures):
+                    future.result()
+                    pbar.update(1)
+
+    # POINT 4: Add progress bar for proxy creation
+    video_clips = [c for c in all_clips if c.get('has_video') and not c.get('_is_screenshare')]
+    if video_clips:
+        logging.info(f'Creating proxies for {len(video_clips)} video clips to speed up rendering...')
+        with tqdm.tqdm(total=len(video_clips), desc="Creating Proxies", unit="file") as pbar:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(_create_proxy_clip, c['file_path'])
+                    for c in video_clips
+                ]
+                for future in as_completed(futures):
+                    # We already assign proxy_path in _download_and_probe_clip,
+                    # but here we ensure they are all processed.
+                    future.result()
+                    pbar.update(1)
 
     logging.info(f'All {len(all_clips)} clips downloaded and probed.')
 

@@ -84,13 +84,9 @@ def download_video_chunk(video_url: str, save_directory: str, client: Optional[h
         # If we get here, we need to download (or redownload)
         with client.stream('GET', video_url) as response:
             response.raise_for_status()
-            total_size = int(response.headers.get('content-length', 0))
             with open(file_path, 'wb') as file:
-                with tqdm.tqdm(total=total_size, unit='B', unit_scale=True,
-                               desc=f'Downloading {filename}') as progress:
-                    for chunk in response.iter_bytes(chunk_size=262144):
-                        file.write(chunk)
-                        progress.update(len(chunk))
+                for chunk in response.iter_bytes(chunk_size=262144):
+                    file.write(chunk)
     except Exception:
         # Clean up partial file on failure
         if os.path.exists(file_path):
