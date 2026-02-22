@@ -58,6 +58,8 @@ def extract_ids_from_url(url: str) -> Tuple[Optional[str], Optional[str]]:
 
 def main():
     logging.basicConfig(level=logging.INFO)
+    # Silence httpx logs to keep progress bars readable
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     args = parse_arguments()
 
@@ -67,16 +69,23 @@ def main():
         return 1
 
     logging.info(f'Starting download: event_sessions={event_sessions}, record_id={record_id}')
-    if fetch_webinar_data(
-        event_sessions=event_sessions,
-        record_id=record_id,
-        session_id=args.session_id,
-        hide_silent=args.hide_silent,
-        max_duration=args.max_duration,
-        start_time=args.start_time
-    ):
-        logging.info('Download completed.')
-        return 0
+    try:
+        if fetch_webinar_data(
+            event_sessions=event_sessions,
+            record_id=record_id,
+            session_id=args.session_id,
+            hide_silent=args.hide_silent,
+            max_duration=args.max_duration,
+            start_time=args.start_time
+        ):
+            logging.info('Download completed.')
+            return 0
+    except KeyboardInterrupt:
+        print("\n\n[!] Interrupted by user. Exiting safely...")
+        return 130
+    except Exception as e:
+        logging.error(f"An unexpected error occurred: {e}")
+        return 1
 
     return 1
 

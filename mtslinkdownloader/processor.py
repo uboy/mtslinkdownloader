@@ -928,6 +928,8 @@ def _render_segment(seg_index: int, segment: dict, streams: dict,
     # Build filter_complex
     filter_parts = []
     overlay_count = 0
+    current_layer = 'bg'
+    video_out_label = 'bg'
 
     # Optimization: if we have a screenshare/slide and NO other cameras,
     # we can skip the black background and overlays entirely.
@@ -1138,7 +1140,8 @@ def render_all_segments(timeline: list, streams: dict, tmpdir: str) -> list:
     segment_files = [None] * len(timeline)
 
     with tqdm.tqdm(total=len(timeline), desc="Rendering segments", unit="seg") as pbar:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        try:
             futures = {}
             for i, segment in enumerate(timeline):
                 future = executor.submit(
@@ -1154,6 +1157,12 @@ def render_all_segments(timeline: list, streams: dict, tmpdir: str) -> list:
                 except Exception as e:
                     logging.error(f'Segment {idx} failed: {e}')
                 pbar.update(1)
+        except KeyboardInterrupt:
+            logging.info("Stopping rendering...")
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        finally:
+            executor.shutdown(wait=True)
 
     return [f for f in segment_files if f is not None]
 
