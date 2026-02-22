@@ -804,6 +804,10 @@ def _render_segment(seg_index: int, segment: dict, streams: dict,
     output_path = os.path.join(tmpdir, f'seg_{seg_index:05d}.mp4')
     t_start = segment['start']
     duration = segment['end'] - segment['start']
+    
+    # Define encoder settings early to avoid UnboundLocalError
+    video_encoder = 'h264_nvenc' if use_nvenc else 'libx264'
+    encoder_preset = 'p1' if use_nvenc else 'ultrafast'
 
     screenshare = segment['screenshare']  # (stream_key, clip, seek) or None
     cameras = segment['cameras']          # [(stream_key, clip, seek), ...]
@@ -923,6 +927,7 @@ def _render_segment(seg_index: int, segment: dict, streams: dict,
 
     # Build filter_complex
     filter_parts = []
+    overlay_count = 0
 
     # Optimization: if we have a screenshare/slide and NO other cameras,
     # we can skip the black background and overlays entirely.
