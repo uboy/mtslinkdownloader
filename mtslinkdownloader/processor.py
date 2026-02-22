@@ -244,7 +244,7 @@ def download_and_probe_all(streams: dict, directory: str, max_workers: int = Non
     all_clips = [c for s in streams.values() for c in s['clips']]
     logging.info(f'Processing {len(all_clips)} clips...')
     reports = []
-    tqdm_args = {"total": len(all_clips), "desc": "Processing files", "unit": "file", "ascii": True, "mininterval": 0.5}
+    tqdm_args = {"total": len(all_clips), "desc": "Processing files", "unit": "file", "ascii": True, "mininterval": 0.5, "leave": True}
     with create_shared_client() as client:
         with tqdm.tqdm(**tqdm_args) as pbar:
             executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -369,7 +369,7 @@ def render_all_segments(timeline: list, streams: dict, tmpdir: str, out_w: int =
     tqdm_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s]: %(message)s', datefmt='%H:%M:%S'))
     root_logger.addHandler(tqdm_handler)
     try:
-        tqdm_args = {"total": len(timeline), "desc": "Rendering", "unit": "seg", "ascii": True, "mininterval": 0.5}
+        tqdm_args = {"total": len(timeline), "desc": "Rendering", "unit": "seg", "ascii": True, "mininterval": 0.5, "leave": True}
         with tqdm.tqdm(**tqdm_args) as pbar:
             executor = ThreadPoolExecutor(max_workers=max_workers)
             try:

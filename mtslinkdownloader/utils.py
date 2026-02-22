@@ -5,10 +5,7 @@ import sys
 def get_base_path():
     """Get the path where the application is running (as script or as binary)."""
     if getattr(sys, 'frozen', False):
-        # Running as bundled executable (PyInstaller)
         return os.path.dirname(sys.executable)
-    # Running as script
-    # Look for the project root (where the main script usually resides)
     return os.getcwd()
 
 def get_logs_path():
@@ -22,7 +19,7 @@ def initialize_logger():
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s [%(levelname)s]: %(message)s',
-        datefmt='%d.%m.%Y %H:%M:%S',
+        datefmt='%H:%M:%S',
         handlers=[logging.FileHandler(log_file, encoding='utf-8'), logging.StreamHandler()],
     )
 
@@ -32,3 +29,15 @@ def create_directory_if_not_exists(directory_name: str) -> str:
     if not os.path.exists(full_path):
         os.makedirs(full_path)
     return full_path
+
+def restore_terminal():
+    """Ensure terminal echo and cursor are restored on Linux/macOS."""
+    if os.name != 'nt': # Linux/macOS
+        try:
+            # Send escape sequence to show cursor
+            sys.stdout.write('\033[?25h')
+            sys.stdout.flush()
+            # Restore echo
+            os.system('stty echo')
+        except Exception:
+            pass

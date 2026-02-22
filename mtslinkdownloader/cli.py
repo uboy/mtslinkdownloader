@@ -93,6 +93,9 @@ def main():
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
         return 1
+    finally:
+        from .utils import restore_terminal
+        restore_terminal()
 
     return 1
 
