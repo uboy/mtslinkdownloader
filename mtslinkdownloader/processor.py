@@ -16,20 +16,18 @@ import imageio_ffmpeg
 
 from .downloader import download_video_chunk, create_shared_client
 
-# Output dimensions
-OUTPUT_WIDTH = 1920
-OUTPUT_HEIGHT = 1080
+# Global stop flag
+STOP_REQUESTED = False
+
+# Default Output settings
 OUTPUT_FPS = 30
-
-# Sidebar layout
-MAIN_WIDTH = 1600
-MAIN_HEIGHT = 1080
-SIDEBAR_WIDTH = 320
-SIDEBAR_HEIGHT = 270
-MAX_SIDEBAR_CAMS = 4
-
-GRID_CONFIGS = {1:(1,1), 2:(2,1), 3:(2,2), 4:(2,2), 5:(3,2), 6:(3,2), 7:(3,3), 8:(3,3), 9:(3,3)}
 MIN_SEGMENT_DURATION = 0.5
+GRID_CONFIGS = {1:(1,1), 2:(2,1), 3:(2,2), 4:(2,2), 5:(3,2), 6:(3,2), 7:(3,3), 8:(3,3), 9:(3,3)}
+
+def request_stop():
+    global STOP_REQUESTED
+    STOP_REQUESTED = True
+    logging.info("!!! Stop requested by user !!!")
 
 # ─── Utilities ──────────────────────────────────────────────────────────
 
@@ -44,26 +42,17 @@ def _get_ffprobe():
     return shutil.which('ffprobe')
 
 def _detect_best_encoder() -> Tuple[str, str, int]:
-    """
-    Detects the best working hardware encoder.
-    Returns: (encoder_name, preset, recommended_workers)
-    """
     ffmpeg = _get_ffmpeg()
-    # 1. Try NVIDIA NVENC
     try:
         test_cmd = [ffmpeg, '-y', '-f', 'lavfi', '-i', 'color=c=black:s=64x64:d=0.1', '-c:v', 'h264_nvenc', '-f', 'null', '-']
         if subprocess.run(test_cmd, capture_output=True, timeout=5).returncode == 0:
-            return 'h264_nvenc', 'p1', 2 # 2 is safest for consumer GPUs
+            return 'h264_nvenc', 'p1', 2
     except Exception: pass
-
-    # 2. Try Intel QuickSync (QSV)
     try:
         test_cmd = [ffmpeg, '-y', '-f', 'lavfi', '-i', 'color=c=black:s=64x64:d=0.1', '-c:v', 'h264_qsv', '-f', 'null', '-']
         if subprocess.run(test_cmd, capture_output=True, timeout=5).returncode == 0:
-            return 'h264_qsv', 'veryfast', 3 # Intel handles multi-session well
+            return 'h264_qsv', 'veryfast', 3
     except Exception: pass
-
-    # 3. Fallback to CPU (libx264)
     cpu_count = os.cpu_count() or 4
     workers = 32 if cpu_count >= 60 else max(1, cpu_count // 2)
     return 'libx264', 'ultrafast', workers
@@ -74,7 +63,6 @@ def _probe_media(file_path: str) -> dict:
         result = subprocess.run(cmd, capture_output=True, text=True)
         data = json.loads(result.stdout)
     except Exception: return {'has_video': False, 'has_audio': False, 'width': 0, 'height': 0, 'duration': 0}
-    
     info = {'has_video': False, 'has_audio': False, 'width': 0, 'height': 0, 'duration': float(data.get('format', {}).get('duration', 0))}
     for s in data.get('streams', []):
         if s.get('codec_type') == 'video':
@@ -83,18 +71,19 @@ def _probe_media(file_path: str) -> dict:
     return info
 
 def _run_ffmpeg(args: list, desc: str = "", timeout: int = None):
+    if STOP_REQUESTED: raise RuntimeError('interrupted')
     cmd = [_get_ffmpeg()] + args
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if result.returncode != 0:
-            if result.returncode in (2, 130, -2): raise RuntimeError('interrupted')
+            if result.returncode in (2, 130, -2) or STOP_REQUESTED: raise RuntimeError('interrupted')
             err_msg = result.stderr[-1000:] if result.stderr else "No stderr"
             logging.error(f'FFmpeg fail ({desc}): {err_msg}')
             raise RuntimeError(f'ffmpeg failed: {desc}')
     except subprocess.TimeoutExpired: raise RuntimeError(f'timeout: {desc}')
 
 def _detect_black_video(file_path: str, duration: float) -> bool:
-    if duration <= 0: return False
+    if duration <= 0 or STOP_REQUESTED: return False
     cmd = [_get_ffmpeg(), '-threads', '2', '-t', str(min(duration, 30.0)), '-i', file_path, '-vf', 'blackdetect=d=0.1:pix_th=0.10', '-an', '-f', 'null', '-']
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -103,7 +92,7 @@ def _detect_black_video(file_path: str, duration: float) -> bool:
     except Exception: return False
 
 def _detect_speech_intervals(file_path: str, duration: float) -> list:
-    if duration <= 0: return []
+    if duration <= 0 or STOP_REQUESTED: return []
     cmd = [_get_ffmpeg(), '-threads', '2', '-i', file_path, '-af', 'silencedetect=noise=-35dB:d=0.5', '-vn', '-f', 'null', '-']
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -140,6 +129,7 @@ def _has_speech_at(timeline: list, t: float) -> bool:
     return False
 
 def _create_proxy_clip(file_path: str, threads: int = 2) -> str:
+    if STOP_REQUESTED: return file_path
     proxy_path = file_path.replace('.mp4', '_proxy.mp4')
     if os.path.exists(proxy_path): return proxy_path
     cmd = [_get_ffmpeg(), '-threads', str(threads), '-y', '-i', file_path, '-vf', 'scale=320:240:force_original_aspect_ratio=decrease,pad=320:240:(ow-iw)/2:(oh-ih)/2:black,setsar=1', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-c:a', 'copy', proxy_path]
@@ -233,6 +223,7 @@ class TqdmLoggingHandler(logging.Handler):
         except Exception: self.handleError(record)
 
 def _download_and_probe_clip(clip: dict, directory: str, client) -> Optional[str]:
+    if STOP_REQUESTED: return "Interrupted"
     try:
         file_path = download_video_chunk(clip['url'], directory, client=client)
         clip['file_path'] = file_path
@@ -248,6 +239,7 @@ def _download_and_probe_clip(clip: dict, directory: str, client) -> Optional[str
     return None
 
 def download_and_probe_all(streams: dict, directory: str, max_workers: int = None):
+    global STOP_REQUESTED
     max_workers = max_workers or min(os.cpu_count() or 4, 48)
     all_clips = [c for s in streams.values() for c in s['clips']]
     logging.info(f'Processing {len(all_clips)} clips...')
@@ -255,12 +247,16 @@ def download_and_probe_all(streams: dict, directory: str, max_workers: int = Non
     tqdm_args = {"total": len(all_clips), "desc": "Processing files", "unit": "file", "ascii": True, "mininterval": 0.5}
     with create_shared_client() as client:
         with tqdm.tqdm(**tqdm_args) as pbar:
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            executor = ThreadPoolExecutor(max_workers=max_workers)
+            try:
                 futures = {executor.submit(_download_and_probe_clip, c, directory, client): c for c in all_clips}
                 for f in as_completed(futures):
+                    if STOP_REQUESTED: executor.shutdown(wait=False, cancel_futures=True); break
                     res = f.result(); 
                     if res: reports.append(res)
                     pbar.update(1)
+            finally: executor.shutdown(wait=True)
+    if STOP_REQUESTED: raise RuntimeError("interrupted")
     for r in reports: logging.info(f'  {r}')
 
 def _find_clip_at_time(stream: dict, t: float):
@@ -309,10 +305,15 @@ def compute_layout_timeline(streams: dict, total_duration: float, admin_user_id:
         else: merged.append(s)
     return merged
 
-def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str, threads: int = 1, encoder: str = 'libx264', preset: str = 'ultrafast') -> str:
+def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str, 
+                    threads: int = 1, encoder: str = 'libx264', preset: str = 'ultrafast',
+                    out_w: int = 1920, out_h: int = 1080) -> str:
+    if STOP_REQUESTED: raise RuntimeError('interrupted')
     output_path = os.path.join(tmpdir, f'seg_{seg_index:05d}.mp4')
     duration = segment['end'] - segment['start']
     inputs, v_inputs, a_inputs, cur_idx = [], [], [], 0
+    main_w = int(out_w * 0.8333); sidebar_w, sidebar_h = out_w - main_w, out_h // 4
+    
     if segment['screenshare']:
         sk, _, _ = segment['screenshare']; clip, seek = _find_clip_at_time(streams[sk], segment['start'])
         if clip:
@@ -332,17 +333,18 @@ def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str, t
             if clip['has_audio'] and len(a_inputs) < 8: a_inputs.append(cur_idx)
             cur_idx += 1
     if not inputs:
-        _run_ffmpeg(['-threads', str(threads), '-y', '-f', 'lavfi', '-i', f'color=black:s={OUTPUT_WIDTH}x{OUTPUT_HEIGHT}:r={OUTPUT_FPS}:d={duration:.3f}', '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo', '-t', f'{duration:.3f}', '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', output_path], desc=f'black {seg_index}')
+        _run_ffmpeg(['-threads', str(threads), '-y', '-f', 'lavfi', '-i', f'color=black:s={out_w}x{out_h}:r={OUTPUT_FPS}:d={duration:.3f}', '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo', '-t', f'{duration:.3f}', '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', output_path], desc=f'black {seg_index}')
         return output_path
-    filter_parts = [f'color=black:s={OUTPUT_WIDTH}x{OUTPUT_HEIGHT}:r={OUTPUT_FPS}:d={duration:.3f}[bg]']
+    filter_parts = [f'color=black:s={out_w}x{out_h}:r={OUTPUT_FPS}:d={duration:.3f}[bg]']
     curr_v, ov_idx, cam_count = 'bg', 0, 0
     for idx, type in v_inputs:
         if type == 'main':
             pts = 'setpts=PTS-STARTPTS,' if not (segment.get('slide_image') and not segment['screenshare']) else ''
-            filter_parts.append(f'[{idx}:v]{pts}scale={MAIN_WIDTH}:{MAIN_HEIGHT}:force_original_aspect_ratio=decrease,pad={MAIN_WIDTH}:{MAIN_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[m_v]')
+            filter_parts.append(f'[{idx}:v]{pts}scale={main_w}:{out_h}:force_original_aspect_ratio=decrease,pad={main_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[m_v]')
             filter_parts.append(f'[{curr_v}][m_v]overlay=0:0:eof_action=repeat[v{ov_idx}]')
         else:
-            filter_parts.append(f'[{curr_v}][{idx}:v]overlay={MAIN_WIDTH}:{cam_count*SIDEBAR_HEIGHT}:eof_action=repeat[v{ov_idx}]')
+            filter_parts.append(f'[{idx}:v]scale={sidebar_w}:{sidebar_h}:force_original_aspect_ratio=decrease,pad={sidebar_w}:{sidebar_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[c{idx}]')
+            filter_parts.append(f'[{curr_v}][c{idx}]overlay={main_w}:{cam_count*sidebar_h}:eof_action=repeat[v{ov_idx}]')
             cam_count += 1
         curr_v, ov_idx = f'v{ov_idx}', ov_idx + 1
     if a_inputs:
@@ -359,12 +361,10 @@ def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str, t
     _run_ffmpeg(cmd, desc=f'seg {seg_index}', timeout=max(120, int(60+duration*30)))
     return output_path
 
-def render_all_segments(timeline: list, streams: dict, tmpdir: str) -> list:
-    encoder, preset, max_workers = _detect_best_encoder()
-    cpu_count = os.cpu_count() or 4
-    threads_per_worker = max(2, cpu_count // max_workers)
-    logging.info(f'Encoder: {encoder}, Workers: {max_workers}, Threads/Worker: {threads_per_worker}')
-    segment_files = [None] * len(timeline)
+def render_all_segments(timeline: list, streams: dict, tmpdir: str, out_w: int = 1920, out_h: int = 1080) -> list:
+    global STOP_REQUESTED
+    encoder, preset, max_workers = _detect_best_encoder(); cpu_count = os.cpu_count() or 4
+    threads_per_worker = max(2, cpu_count // max_workers); segment_files = [None] * len(timeline)
     tqdm_handler = TqdmLoggingHandler(); root_logger = logging.getLogger()
     tqdm_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s]: %(message)s', datefmt='%H:%M:%S'))
     root_logger.addHandler(tqdm_handler)
@@ -373,8 +373,9 @@ def render_all_segments(timeline: list, streams: dict, tmpdir: str) -> list:
         with tqdm.tqdm(**tqdm_args) as pbar:
             executor = ThreadPoolExecutor(max_workers=max_workers)
             try:
-                futures = {executor.submit(_render_segment, i, s, streams, tmpdir, threads_per_worker, encoder, preset): i for i, s in enumerate(timeline)}
+                futures = {executor.submit(_render_segment, i, s, streams, tmpdir, threads_per_worker, encoder, preset, out_w, out_h): i for i, s in enumerate(timeline)}
                 for f in as_completed(futures):
+                    if STOP_REQUESTED: executor.shutdown(wait=False, cancel_futures=True); break
                     idx = futures[f]
                     try: 
                         res = f.result()
@@ -384,18 +385,24 @@ def render_all_segments(timeline: list, streams: dict, tmpdir: str) -> list:
                         if 'interrupted' not in str(e): logging.error(f'Critical: Segment {idx} failed: {e}')
                         executor.shutdown(wait=False, cancel_futures=True); raise
                     pbar.update(1)
-            except KeyboardInterrupt: executor.shutdown(wait=False, cancel_futures=True); raise
             finally: executor.shutdown(wait=True)
     finally: root_logger.removeHandler(tqdm_handler)
+    if STOP_REQUESTED: raise RuntimeError("interrupted")
+    if None in segment_files: raise RuntimeError("Some segments failed. Aborted.")
     return segment_files
 
 def concat_segments(segment_files: list, output_path: str):
+    if STOP_REQUESTED: return
     list_path = os.path.join(os.path.dirname(segment_files[0]), 'concat.txt')
     with open(list_path, 'w') as f:
         for s in segment_files: f.write(f"file '{s.replace(chr(92), '/')}'\n")
     _run_ffmpeg(['-y', '-f', 'concat', '-safe', '0', '-fflags', '+genpts', '-i', list_path, '-c', 'copy', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', output_path], desc='concat')
 
-def process_composite_video(directory: str, json_data: dict, output_path: str, max_duration=None, hide_silent: bool = False, start_time: float = 0):
+def process_composite_video(directory: str, json_data: dict, output_path: str, max_duration=None, hide_silent: bool = False, start_time: float = 0, quality: str = "1080p"):
+    global STOP_REQUESTED
+    STOP_REQUESTED = False # Reset on new start
+    res_map = {"1080p": (1920, 1080), "720p": (1280, 720)}
+    out_w, out_h = res_map.get(quality, (1920, 1080))
     total_duration = float(json_data.get('duration', 0))
     if max_duration: total_duration = min(total_duration, start_time + max_duration)
     streams, admin_id = parse_event_logs(json_data)
@@ -411,6 +418,7 @@ def process_composite_video(directory: str, json_data: dict, output_path: str, m
         slide_map = {}
         with create_shared_client() as client:
             for i, url in enumerate(list(dict.fromkeys(slides))):
+                if STOP_REQUESTED: break
                 path = os.path.join(directory, f'slide_{i:03d}.jpg')
                 if not os.path.exists(path):
                     try:
@@ -418,6 +426,7 @@ def process_composite_video(directory: str, json_data: dict, output_path: str, m
                     except Exception: continue
                 slide_map[url] = path
         s_timeline = [(s, e, slide_map[u]) for s, e, u in (s_timeline or []) if u in slide_map]
+    if STOP_REQUESTED: raise RuntimeError("interrupted")
     speech_timelines = {sk: _build_stream_speech_timeline(s) for sk, s in streams.items() if not s['is_screenshare']} if hide_silent else {}
     timeline = compute_layout_timeline(streams, total_duration, admin_id, hide_silent, speech_timelines, start_time, s_timeline)
     if not timeline: return
@@ -425,7 +434,7 @@ def process_composite_video(directory: str, json_data: dict, output_path: str, m
         active = {streams[sk]['user_name'] for sk, t in speech_timelines.items() if t}
         logging.info(f'Active participants: {len(active)} ({", ".join(list(active)[:5])}...)')
     with tempfile.TemporaryDirectory() as tmp:
-        files = render_all_segments(timeline, streams, tmp)
+        files = render_all_segments(timeline, streams, tmp, out_w, out_h)
         if files: concat_segments(files, output_path)
     logging.info(f'Done: {output_path}')
 

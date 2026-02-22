@@ -10,7 +10,7 @@ from typing import Optional
 from mtslinkdownloader.webinar import fetch_webinar_data
 from mtslinkdownloader.utils import get_base_path, create_directory_if_not_exists
 from mtslinkdownloader.cli import extract_ids_from_url
-from mtslinkdownloader.processor import process_composite_video
+from mtslinkdownloader.processor import process_composite_video, request_stop
 from mtslinkdownloader.downloader import construct_json_data_url, fetch_json_data
 
 class TextRedirector:
@@ -20,27 +20,20 @@ class TextRedirector:
 
     def write(self, s):
         if not s: return
-        # Use after() to ensure UI updates happen in the main thread
         self.textbox.after(0, self._safe_write, s)
 
     def _safe_write(self, s):
         try:
             self.textbox.configure(state="normal")
             if '\r' in s:
-                # Handle tqdm carriage return by overwriting the last line
-                # We split by \r and take the last part
                 parts = s.split('\r')
                 if parts[-1].strip():
-                    # Delete the last line before inserting the new progress
                     self.textbox.delete("end-2l", "end-1l")
                     self.textbox.insert("end", parts[-1] + "\n")
             else:
                 self.textbox.insert("end", s)
-            
-            # Limit scrollback to 5000 lines to prevent memory issues
             if int(self.textbox.index('end-1c').split('.')[0]) > 5000:
                 self.textbox.delete('1.0', '2.0')
-                
             self.textbox.see("end")
             self.textbox.configure(state="disabled")
         except Exception: pass
@@ -53,11 +46,11 @@ class App(ctk.CTk):
         super().__init__()
 
         self.title("MTS Link Downloader")
-        self.geometry("1000x800")
+        self.geometry("1000x850")
         ctk.set_appearance_mode("dark")
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(7, weight=1)
+        self.grid_rowconfigure(8, weight=1)
 
         # UI Elements
         self.label = ctk.CTkLabel(self, text="MTS Link Webinar Downloader", font=ctk.CTkFont(size=24, weight="bold"))
@@ -70,54 +63,81 @@ class App(ctk.CTk):
 
         self.settings_frame = ctk.CTkFrame(self)
         self.settings_frame.grid(row=3, column=0, padx=20, pady=10, sticky="ew")
-        self.settings_frame.grid_columnconfigure((0, 1, 2), weight=1)
+        self.settings_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
+        # Session ID
         self.sid_label = ctk.CTkLabel(self.settings_frame, text="Session ID (Optional):")
         self.sid_label.grid(row=0, column=0, padx=10, pady=(5, 0), sticky="w")
         self.session_id = ctk.CTkEntry(self.settings_frame)
         self.session_id.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="ew")
 
+        # Start Time
         self.st_label = ctk.CTkLabel(self.settings_frame, text="Start offset (seconds):")
         self.st_label.grid(row=0, column=1, padx=10, pady=(5, 0), sticky="w")
         self.start_time = ctk.CTkEntry(self.settings_frame)
         self.start_time.insert(0, "0")
         self.start_time.grid(row=1, column=1, padx=10, pady=(0, 10), sticky="ew")
 
-        self.dur_label = ctk.CTkLabel(self.settings_frame, text="Max duration (seconds):")
+        # Max duration
+        self.dur_label = ctk.CTkLabel(self.settings_frame, text="Limit duration (seconds):")
         self.dur_label.grid(row=0, column=2, padx=10, pady=(5, 0), sticky="w")
         self.max_duration = ctk.CTkEntry(self.settings_frame)
         self.max_duration.grid(row=1, column=2, padx=10, pady=(0, 10), sticky="ew")
+
+        # Quality
+        self.q_label = ctk.CTkLabel(self.settings_frame, text="Video Quality:")
+        self.q_label.grid(row=0, column=3, padx=10, pady=(5, 0), sticky="w")
+        self.quality_var = ctk.StringVar(value="FULL HD (1920x1080)")
+        self.quality_menu = ctk.CTkOptionMenu(self.settings_frame, values=["FULL HD (1920x1080)", "HD (1280x720)"], variable=self.quality_var)
+        self.quality_menu.grid(row=1, column=3, padx=10, pady=(0, 10), sticky="ew")
 
         self.hide_silent = ctk.CTkCheckBox(self, text="Aggressive optimization: Hide non-speaking participants")
         self.hide_silent.select() 
         self.hide_silent.grid(row=4, column=0, padx=20, pady=5)
 
-        self.download_btn = ctk.CTkButton(self, text="START DOWNLOAD & RENDER", command=self.start_task, 
+        self.hint = ctk.CTkLabel(self, text="Tip: 0 in 'Start offset' means from the beginning. Duration is in seconds (600 = 10 min).", 
+                                font=ctk.CTkFont(size=11, slant="italic"), text_color="gray")
+        self.hint.grid(row=5, column=0, padx=20, pady=0)
+
+        # Control Buttons Frame
+        self.btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.btn_frame.grid(row=6, column=0, padx=20, pady=15, sticky="ew")
+        self.btn_frame.grid_columnconfigure((0, 1), weight=1)
+
+        self.download_btn = ctk.CTkButton(self.btn_frame, text="START DOWNLOAD & RENDER", command=self.start_task, 
                                          font=ctk.CTkFont(size=16, weight="bold"), height=50, fg_color="#2c8c2c", hover_color="#1e5e1e")
-        self.download_btn.grid(row=5, column=0, padx=20, pady=15)
+        self.download_btn.grid(row=0, column=0, padx=10, pady=0, sticky="ew")
+
+        self.stop_btn = ctk.CTkButton(self.btn_frame, text="STOP", command=self.stop_task, 
+                                      font=ctk.CTkFont(size=16, weight="bold"), height=50, fg_color="#a83232", hover_color="#7a2424", state="disabled")
+        self.stop_btn.grid(row=0, column=1, padx=10, pady=0, sticky="ew")
 
         self.console_label = ctk.CTkLabel(self, text="Progress & Logs:", font=ctk.CTkFont(weight="bold"))
-        self.console_label.grid(row=6, column=0, padx=20, pady=(5, 0), sticky="w")
+        self.console_label.grid(row=7, column=0, padx=20, pady=(5, 0), sticky="w")
         
         self.console = ctk.CTkTextbox(self, state="disabled", font=ctk.CTkFont(family="Consolas", size=12))
-        self.console.grid(row=7, column=0, padx=20, pady=(0, 20), sticky="nsew")
+        self.console.grid(row=8, column=0, padx=20, pady=(0, 20), sticky="nsew")
 
-        # REDIRECTION MAGIC
+        # REDIRECTION
         self.redirector = TextRedirector(self.console)
         sys.stdout = self.redirector
         sys.stderr = self.redirector
 
-        # Initial logging setup
         logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s]: %(message)s', datefmt='%H:%M:%S', stream=sys.stderr)
         logging.getLogger("httpx").setLevel(logging.WARNING)
 
         print(f"App initialized. Base path: {get_base_path()}")
-        print("Ready. Paste your link and click Start.\n")
+        print("Ready.\n")
+
+    def stop_task(self):
+        self.stop_btn.configure(state="disabled", text="Stopping...")
+        request_stop()
 
     def start_task(self):
         url = self.url_entry.get().strip()
         if not url: return
         self.download_btn.configure(state="disabled", text="PROCESSING...")
+        self.stop_btn.configure(state="normal")
         
         s_id = self.session_id.get().strip() or None
         try:
@@ -126,12 +146,14 @@ class App(ctk.CTk):
         except ValueError:
             print("Error: Invalid numeric values.")
             self.download_btn.configure(state="normal", text="START")
+            self.stop_btn.configure(state="disabled")
             return
             
-        thread = threading.Thread(target=self.run_process, args=(url, s_id, t_start, t_max, self.hide_silent.get()), daemon=True)
+        quality = "1080p" if "1920" in self.quality_var.get() else "720p"
+        thread = threading.Thread(target=self.run_process, args=(url, s_id, t_start, t_max, self.hide_silent.get(), quality), daemon=True)
         thread.start()
 
-    def run_process(self, url, s_id, t_start, t_max, h_silent):
+    def run_process(self, url, s_id, t_start, t_max, h_silent, quality):
         try:
             event_sessions, record_id = extract_ids_from_url(url)
             if not event_sessions:
@@ -151,16 +173,27 @@ class App(ctk.CTk):
             print("-" * 40)
             print(f"  Start offset: {t_start} seconds")
             print(f"  Max duration: {t_max if t_max else 'Full record'} seconds")
+            print(f"  Quality:      {quality.upper()}")
             print(f"  Session ID:   {'Set' if s_id else 'Not set'}")
             print(f"  Optimization: {'Aggressive (Hide Silent)' if h_silent else 'Standard'}")
             print("-" * 40)
             
-            process_composite_video(directory, json_data, output_video_path, t_max, hide_silent=h_silent, start_time=t_start)
-            print("\n!!! SUCCESS !!! Video is ready.")
+            process_composite_video(directory, json_data, output_video_path, t_max, hide_silent=h_silent, start_time=t_start, quality=quality)
+            
+            full_path = os.path.abspath(output_video_path)
+            print(f"\n!!! SUCCESS !!! Video is ready.")
+            print(f"Path: {full_path}")
         except Exception as e:
-            print(f"\nFATAL ERROR: {e}")
+            if "interrupted" in str(e).lower():
+                print("\n[!] Process stopped by user.")
+            else:
+                print(f"\nFATAL ERROR: {e}")
         finally:
-            self.download_btn.after(0, lambda: self.download_btn.configure(state="normal", text="START DOWNLOAD & RENDER"))
+            self.download_btn.after(0, self._reset_buttons)
+
+    def _reset_buttons(self):
+        self.download_btn.configure(state="normal", text="START DOWNLOAD & RENDER")
+        self.stop_btn.configure(state="disabled", text="STOP")
 
 def main():
     app = App()

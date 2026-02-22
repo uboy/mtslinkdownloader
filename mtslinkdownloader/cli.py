@@ -44,6 +44,12 @@ def parse_arguments():
         default=0,
         help='Start processing from this time offset in seconds (e.g. 2400).'
     )
+    parser.add_argument(
+        '--quality',
+        choices=['720p', '1080p'],
+        default='1080p',
+        help='Output video quality (resolution). Default is 1080p.'
+    )
     return parser.parse_args()
 
 
@@ -76,7 +82,8 @@ def main():
             session_id=args.session_id,
             hide_silent=args.hide_silent,
             max_duration=args.max_duration,
-            start_time=args.start_time
+            start_time=args.start_time,
+            quality=args.quality
         ):
             logging.info('Download completed.')
             return 0
