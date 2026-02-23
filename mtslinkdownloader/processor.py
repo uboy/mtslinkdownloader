@@ -6,6 +6,7 @@ import re
 import sys
 import subprocess
 import tempfile
+from bisect import bisect_right
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple, Union
@@ -150,6 +151,35 @@ def _create_name_placeholder(name: str, directory: str, w: int, h: int) -> str:
         subprocess.run(cmd, capture_output=True, check=True)
         return path
     except Exception: return None
+
+
+def _is_lecturer_stream(stream: dict, admin_user_id: Optional[int]) -> bool:
+    user_id = stream.get('user_id')
+    if stream.get('is_admin'):
+        return True
+    return bool(admin_user_id and user_id and user_id == admin_user_id)
+
+
+def _build_chat_overlay_text(events: Optional[list], t: float, max_lines: int = 6) -> str:
+    if not events:
+        return "CHAT: no messages yet"
+    visible = [e for e in events if e.get('time', 0) <= t]
+    if not visible:
+        return "CHAT: no messages yet"
+    lines = []
+    for e in visible[-max_lines:]:
+        kind = str(e.get('type', 'CHAT')).upper()
+        user = str(e.get('user', 'System')).replace('\n', ' ').strip() or 'System'
+        text = str(e.get('text', '')).replace('\n', ' ').strip()
+        lines.append(f"[{kind}] {user}: {text}")
+    return '\n'.join(lines)
+
+
+def _escape_drawtext_path(path: str) -> str:
+    normalized = path.replace('\\', '/')
+    normalized = normalized.replace(':', r'\:')
+    normalized = normalized.replace("'", r"\'")
+    return normalized
 
 # ─── Parsing ─────────────────────────────────────────────────────────────
 
@@ -310,8 +340,9 @@ def _find_clip_at_time(stream: dict, t: float):
             return c, t - c['relative_time']
     return None, 0
 
-def compute_layout_timeline(streams: dict, total_duration: float, admin_user_id: Optional[int], hide_silent: bool = False, speech_timelines: Optional[dict] = None, start_time: float = 0, slide_timeline: Optional[list] = None) -> list:
+def compute_layout_timeline(streams: dict, total_duration: float, admin_user_id: Optional[int], hide_silent: bool = False, speech_timelines: Optional[dict] = None, start_time: float = 0, slide_timeline: Optional[list] = None, events: Optional[list] = None) -> list:
     change_points = {start_time, total_duration}
+    event_times = sorted(e.get('time', 0) for e in (events or []) if start_time <= e.get('time', 0) <= total_duration)
     for s in streams.values():
         for c in s['clips']:
             if c['duration'] > 0:
@@ -320,6 +351,8 @@ def compute_layout_timeline(streams: dict, total_duration: float, admin_user_id:
     for s_s, s_e, _ in (slide_timeline or []):
         if s_s >= start_time: change_points.add(s_s)
         if s_e <= total_duration: change_points.add(s_e)
+    for t in event_times:
+        change_points.add(t)
     sorted_p = sorted(list(change_points))
     filtered = [sorted_p[0]]
     for p in sorted_p[1:]:
@@ -331,21 +364,31 @@ def compute_layout_timeline(streams: dict, total_duration: float, admin_user_id:
             clip, seek = _find_clip_at_time(s, t_m)
             if clip: active.append((sk, clip, seek))
         screenshare = next((a for a in active if streams[a[0]]['is_screenshare']), None)
-        cameras = [a for a in active if not streams[a[0]]['is_screenshare']]
+        all_cameras = [a for a in active if not streams[a[0]]['is_screenshare']]
+        audio_sources = [a for a in active if a[1]['has_audio']]
+        lecturer = next((c for c in all_cameras if _is_lecturer_stream(streams[c[0]], admin_user_id)), None)
+        cameras = list(all_cameras)
         if hide_silent and speech_timelines:
-            speaking = [c for c in cameras if _has_speech_at(speech_timelines.get(c[0], []), t_m)]
-            cameras = speaking
+            speaking = [c for c in all_cameras if _has_speech_at(speech_timelines.get(c[0], []), t_m)]
+            cameras = ([lecturer] if lecturer else []) + [c for c in speaking if not lecturer or c[0] != lecturer[0]]
         cameras = [c for c in cameras if c[1]['has_video'] or c[1]['has_audio']]
+        if lecturer and not any(c[0] == lecturer[0] for c in cameras):
+            if lecturer[1]['has_video'] or lecturer[1]['has_audio']:
+                cameras = [lecturer] + cameras
+        cameras.sort(key=lambda c: (0 if _is_lecturer_stream(streams[c[0]], admin_user_id) else 1, streams[c[0]].get('user_name', '').lower()))
         slide = next((path for s_s, s_e, path in (slide_timeline or []) if s_s <= t_m < s_e), None) if not screenshare else None
-        segments.append({'start': t_s, 'end': t_e, 'screenshare': screenshare, 'cameras': cameras, 'slide_image': slide})
+        chat_version = bisect_right(event_times, t_m)
+        segments.append({'start': t_s, 'end': t_e, 'screenshare': screenshare, 'cameras': cameras, 'audio_sources': audio_sources, 'slide_image': slide, 'chat_version': chat_version})
     if not segments: return []
     merged = [segments[0]]
     for s in segments[1:]:
         prev = merged[-1]
         s_prev = {(sk, c['file_path']) for sk, c, _ in ([prev['screenshare']] if prev['screenshare'] else []) + prev['cameras']}
         if prev.get('slide_image'): s_prev.add(('slide', prev['slide_image']))
+        s_prev.add(('chat', prev.get('chat_version', 0)))
         s_curr = {(sk, c['file_path']) for sk, c, _ in ([s['screenshare']] if s['screenshare'] else []) + s['cameras']}
         if s.get('slide_image'): s_curr.add(('slide', s['slide_image']))
+        s_curr.add(('chat', s.get('chat_version', 0)))
         if abs(prev['end'] - s['start']) < 0.001 and s_prev == s_curr: prev['end'] = s['end']
         else: merged.append(s)
     return merged
@@ -358,6 +401,18 @@ def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str,
     t_start, duration = segment['start'], segment['end'] - segment['start']
     inputs, v_inputs, a_inputs, cur_idx = [], [], [], 0
     main_w = (int(out_w * 0.8333) // 2) * 2; sidebar_w = out_w - main_w; sidebar_h = out_h // 4
+    cam_visual_count = 0
+    max_cam_slots = 3
+    audio_input_by_stream = {}
+    added_audio_inputs = set()
+
+    def _append_audio_input(input_idx: int):
+        if input_idx in added_audio_inputs:
+            return
+        if len(a_inputs) >= 8:
+            return
+        added_audio_inputs.add(input_idx)
+        a_inputs.append(input_idx)
     
     if segment['screenshare']:
         sk, _, _ = segment['screenshare']
@@ -365,7 +420,9 @@ def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str,
         if clip:
             inputs.extend(['-ss', f'{seek:.3f}', '-t', f'{duration+1:.3f}', '-thread_queue_size', '1024', '-i', clip['file_path']])
             if clip['has_video']: v_inputs.append((cur_idx, 'main', None))
-            if clip['has_audio']: a_inputs.append(cur_idx)
+            if clip['has_audio']:
+                audio_input_by_stream[sk] = cur_idx
+                _append_audio_input(cur_idx)
             cur_idx += 1
     elif segment.get('slide_image'):
         inputs.extend(['-loop', '1', '-framerate', str(OUTPUT_FPS), '-t', f'{duration:.3f}', '-i', segment['slide_image']])
@@ -379,19 +436,36 @@ def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str,
         if clip['has_video']:
             path = clip.get('proxy_path', clip['file_path'])
             inputs.extend(['-ss', f'{seek:.3f}', '-t', f'{duration+1:.3f}', '-thread_queue_size', '1024', '-i', path])
-            if len(v_inputs) < 4: 
+            if cam_visual_count < max_cam_slots:
                 v_inputs.append((cur_idx, 'cam', user_name))
-                cur_idx += 1
-            if clip['has_audio'] and len(a_inputs) < 8: a_inputs.append(cur_idx - 1)
+                cam_visual_count += 1
+            if clip['has_audio']:
+                audio_input_by_stream[sk] = cur_idx
+                _append_audio_input(cur_idx)
+            cur_idx += 1
         elif clip['has_audio']:
             img_path = _create_name_placeholder(user_name, os.path.dirname(output_path), sidebar_w, sidebar_h)
-            if img_path:
+            if img_path and cam_visual_count < max_cam_slots:
                 inputs.extend(['-loop', '1', '-framerate', str(OUTPUT_FPS), '-t', f'{duration:.3f}', '-i', img_path])
-                if len(v_inputs) < 4: 
-                    v_inputs.append((cur_idx, 'main_no_pts', None))
-                    cur_idx += 1
+                v_inputs.append((cur_idx, 'cam', user_name))
+                cam_visual_count += 1
+                cur_idx += 1
             inputs.extend(['-ss', f'{seek:.3f}', '-t', f'{duration+1:.3f}', '-thread_queue_size', '1024', '-i', clip['file_path']])
-            a_inputs.append(cur_idx); cur_idx += 1
+            audio_input_by_stream[sk] = cur_idx
+            _append_audio_input(cur_idx)
+            cur_idx += 1
+
+    for sk, _, _ in segment.get('audio_sources', segment['cameras']):
+        clip, seek = _find_clip_at_time(streams[sk], t_start)
+        if not clip or not clip['has_audio']:
+            continue
+        if sk in audio_input_by_stream:
+            _append_audio_input(audio_input_by_stream[sk])
+            continue
+        inputs.extend(['-ss', f'{seek:.3f}', '-t', f'{duration+1:.3f}', '-thread_queue_size', '1024', '-i', clip['file_path']])
+        audio_input_by_stream[sk] = cur_idx
+        _append_audio_input(cur_idx)
+        cur_idx += 1
 
     if not inputs:
         _run_ffmpeg(['-threads', str(threads), '-y', '-f', 'lavfi', '-i', f'color=black:s={out_w}x{out_h}:r={OUTPUT_FPS}:d={duration:.3f}', '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo', '-t', f'{duration:.3f}', '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', output_path], desc=f'black {seg_index}')
@@ -414,12 +488,19 @@ def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str,
             cam_count += 1
         curr_v, ov_idx = f'v{ov_idx}', ov_idx + 1
 
-    msg = next((e for e in (events or []) if t_start <= e['time'] <= t_start + duration), None)
-    if msg:
-        txt = f"{msg['type']} | {msg['user']}\\: {msg['text'][:80].replace(':','').replace(chr(39),'')}"
-        filter_parts.append(f'color=black@0.6:s={sidebar_w}x{sidebar_h}:d={duration:.3f},drawtext=text=\'{txt}\':fontcolor=cyan:fontsize=14:x=10:y=(h-text_h)/2[chat]')
-        filter_parts.append(f'[{curr_v}][chat]overlay={main_w}:{3*sidebar_h}[v_fin]')
-        curr_v = 'v_fin'
+    chat_txt = _build_chat_overlay_text(events, t_start)
+    chat_path = os.path.join(tmpdir, f'chat_{seg_index:05d}.txt')
+    with open(chat_path, 'w', encoding='utf-8') as f:
+        f.write(chat_txt)
+    esc_chat_path = _escape_drawtext_path(chat_path)
+    filter_parts.append(
+        f"color=black@0.68:s={sidebar_w}x{sidebar_h}:d={duration:.3f},"
+        f"drawbox=x=0:y=0:w=iw:h=ih:color=white@0.10:t=2,"
+        f"drawtext=text='CHAT / Q&A':fontcolor=white:fontsize=16:x=10:y=8,"
+        f"drawtext=fontcolor=cyan:fontsize=14:line_spacing=5:x=10:y=34:textfile='{esc_chat_path}':reload=0[chat]"
+    )
+    filter_parts.append(f'[{curr_v}][chat]overlay={main_w}:{3*sidebar_h}[v_fin]')
+    curr_v = 'v_fin'
 
     if a_inputs:
         for i, idx in enumerate(a_inputs): filter_parts.append(f'[{idx}:a]asetpts=PTS-STARTPTS,aresample=44100,apad=whole_dur={duration:.3f}[a{i}]')
@@ -505,7 +586,7 @@ def process_composite_video(directory: str, json_data: dict, output_path: str, m
         s_timeline = [(s, e, slide_map[u]) for s, e, u in (s_timeline or []) if u in slide_map]
     if STOP_REQUESTED: raise RuntimeError("interrupted")
     speech_timelines = {sk: _build_stream_speech_timeline(s) for sk, s in streams.items() if not s['is_screenshare']} if hide_silent else {}
-    timeline = compute_layout_timeline(streams, total_duration, admin_id, hide_silent, speech_timelines, start_time, s_timeline)
+    timeline = compute_layout_timeline(streams, total_duration, admin_id, hide_silent, speech_timelines, start_time, s_timeline, all_events)
     if not timeline: return
     if hide_silent:
         active = {streams[sk]['user_name'] for sk, t in speech_timelines.items() if t}

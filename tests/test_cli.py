@@ -46,6 +46,7 @@ def test_main_returns_error_for_invalid_url(monkeypatch):
             hide_silent=False,
             max_duration=None,
             start_time=0,
+            quality="1080p",
         ),
     )
     monkeypatch.setattr(
@@ -69,6 +70,7 @@ def test_main_returns_zero_and_forwards_args(monkeypatch):
             hide_silent=True,
             max_duration=120.0,
             start_time=30.0,
+            quality="720p",
         ),
     )
 
@@ -86,6 +88,7 @@ def test_main_returns_zero_and_forwards_args(monkeypatch):
         "hide_silent": True,
         "max_duration": 120.0,
         "start_time": 30.0,
+        "quality": "720p",
     }
 
 
@@ -99,6 +102,7 @@ def test_main_returns_error_when_fetch_fails(monkeypatch):
             hide_silent=False,
             max_duration=None,
             start_time=0,
+            quality="1080p",
         ),
     )
     monkeypatch.setattr(cli, "fetch_webinar_data", lambda **_: None)
