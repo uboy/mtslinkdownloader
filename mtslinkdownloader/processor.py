@@ -501,16 +501,25 @@ def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str,
     output_path = os.path.join(tmpdir, f'seg_{seg_index:05d}.mp4')
     t_start, duration = segment['start'], segment['end'] - segment['start']
     inputs, v_inputs, a_inputs, cur_idx = [], [], [], 0
-    main_w = (int(out_w * 0.8333) // 2) * 2
+    main_w = (int(out_w * 0.75) // 2) * 2
     sidebar_w = out_w - main_w
-    cam_h = max(120, out_h // 5)
-    chat_h = out_h - (3 * cam_h)
-    chat_w = min(out_w, (int(sidebar_w * 1.5) // 2) * 2)
-    chat_x = out_w - chat_w
-    cam_w = max(120, (int(sidebar_w * 0.84) // 2) * 2)
-    cam_x = main_w + (sidebar_w - cam_w) // 2
+    gap = max(8, out_h // 90)
+    cam_w = (sidebar_w - 3 * gap) // 2
+    cam_w = max(100, (cam_w // 2) * 2)
+    cam_h = max(90, int(cam_w * 0.75))
+    cam_h = (cam_h // 2) * 2
+    chat_y = 2 * cam_h + 3 * gap
+    chat_h = max(120, out_h - chat_y - gap)
+    chat_w = max(120, ((2 * cam_w + gap - max(4, gap // 2)) // 2) * 2)
+    chat_x = main_w + (sidebar_w - chat_w) // 2
+    cam_slots = [
+        (main_w + gap, gap),
+        (main_w + 2 * gap + cam_w, gap),
+        (main_w + gap, 2 * gap + cam_h),
+        (main_w + 2 * gap + cam_w, 2 * gap + cam_h),
+    ]
     cam_visual_count = 0
-    max_cam_slots = 3
+    max_cam_slots = 4
     audio_input_by_stream = {}
     added_audio_inputs = set()
 
@@ -584,15 +593,17 @@ def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str,
     for idx, type, name in v_inputs:
         if type == 'main':
             pts = 'setpts=PTS-STARTPTS,' if not (segment.get('slide_image') and not segment['screenshare']) else ''
-            filter_parts.append(f'[{idx}:v]{pts}scale={main_w}:{out_h}:force_original_aspect_ratio=decrease,pad=max({main_w}\,iw):max({out_h}\,ih):(ow-iw)/2:(oh-ih)/2:black,setsar=1,scale={main_w}:{out_h}[m_v]')
+            filter_parts.append(f'[{idx}:v]{pts}scale={main_w}:{out_h}:force_original_aspect_ratio=decrease,pad={main_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,scale={main_w}:{out_h}[m_v]')
             filter_parts.append(f'[{curr_v}][m_v]overlay=0:0:eof_action=repeat[v{ov_idx}]')
         elif type == 'main_no_pts':
             filter_parts.append(f'[{idx}:v]scale={cam_w}:{cam_h},setsar=1[c{idx}]')
-            filter_parts.append(f'[{curr_v}][c{idx}]overlay={cam_x}:{cam_count*cam_h}:eof_action=repeat[v{ov_idx}]')
+            slot_x, slot_y = cam_slots[min(cam_count, len(cam_slots)-1)]
+            filter_parts.append(f'[{curr_v}][c{idx}]overlay={slot_x}:{slot_y}:eof_action=repeat[v{ov_idx}]')
             cam_count += 1
         else:
-            filter_parts.append(f'[{idx}:v]scale={cam_w}:{cam_h}:force_original_aspect_ratio=decrease,pad=max({cam_w}\,iw):max({cam_h}\,ih):(ow-iw)/2:(oh-ih)/2:black,setsar=1,scale={cam_w}:{cam_h}[c{idx}]')
-            filter_parts.append(f'[{curr_v}][c{idx}]overlay={cam_x}:{cam_count*cam_h}:eof_action=repeat[v{ov_idx}]')
+            filter_parts.append(f'[{idx}:v]scale={cam_w}:{cam_h}:force_original_aspect_ratio=decrease,pad={cam_w}:{cam_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,scale={cam_w}:{cam_h}[c{idx}]')
+            slot_x, slot_y = cam_slots[min(cam_count, len(cam_slots)-1)]
+            filter_parts.append(f'[{curr_v}][c{idx}]overlay={slot_x}:{slot_y}:eof_action=repeat[v{ov_idx}]')
             cam_count += 1
         curr_v, ov_idx = f'v{ov_idx}', ov_idx + 1
 
@@ -606,10 +617,10 @@ def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str,
     filter_parts.append(
         f"color=black@0.68:s={chat_w}x{chat_h}:d={duration:.3f},"
         f"drawbox=x=0:y=0:w=iw:h=ih:color=white@0.10:t=2,"
-        f"drawtext=text='CHAT / Q&A':fontcolor=white:fontsize=16:x=10:y=8,"
-        f"drawtext=fontcolor=cyan:fontsize=14:line_spacing=5:x=10:y=34:textfile='{esc_chat_path}':reload=0[chat]"
+        f"drawtext=text='CHAT / Q&A':fontcolor=white:fontsize=15:x=10:y=8,"
+        f"drawtext=fontcolor=cyan:fontsize=13:line_spacing=5:x=10:y=32:textfile='{esc_chat_path}':reload=0[chat]"
     )
-    filter_parts.append(f'[{curr_v}][chat]overlay={chat_x}:{3*cam_h}[v_fin]')
+    filter_parts.append(f'[{curr_v}][chat]overlay={chat_x}:{chat_y}[v_fin]')
     curr_v = 'v_fin'
 
     if a_inputs:
