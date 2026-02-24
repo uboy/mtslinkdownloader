@@ -3,6 +3,7 @@ import logging
 import re
 from typing import Optional, Tuple
 
+from .utils import initialize_logger
 from .webinar import fetch_webinar_data
 
 URL_PATTERN = re.compile(
@@ -63,7 +64,7 @@ def extract_ids_from_url(url: str) -> Tuple[Optional[str], Optional[str]]:
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, force=True)
+    initialize_logger(force=False)
     # Silence httpx logs to keep progress bars readable
     logging.getLogger("httpx").setLevel(logging.WARNING)
 

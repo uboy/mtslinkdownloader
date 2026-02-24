@@ -2,10 +2,10 @@ import os
 from typing import Dict, Optional, Union
 
 import httpx
-import tqdm
 import logging
 
-TIMEOUT_SETTINGS = httpx.Timeout(None, connect=None)
+API_TIMEOUT_SETTINGS = httpx.Timeout(60.0, connect=15.0)
+DOWNLOAD_TIMEOUT_SETTINGS = httpx.Timeout(300.0, connect=15.0)
 CONNECTION_LIMITS = httpx.Limits(max_connections=10, max_keepalive_connections=8)
 
 
@@ -23,7 +23,7 @@ def fetch_json_data(url: str, session_id: Union[str, None]) -> Dict:
     if session_id:
         cookies['sessionId'] = session_id
 
-    with httpx.Client(timeout=TIMEOUT_SETTINGS) as client:
+    with httpx.Client(timeout=API_TIMEOUT_SETTINGS) as client:
         response = client.get(
             url,
             headers={
@@ -49,7 +49,7 @@ def fetch_json_data(url: str, session_id: Union[str, None]) -> Dict:
 
 def create_shared_client() -> httpx.Client:
     """Create a shared httpx client with connection pooling for reuse across downloads."""
-    return httpx.Client(timeout=TIMEOUT_SETTINGS, limits=CONNECTION_LIMITS)
+    return httpx.Client(timeout=DOWNLOAD_TIMEOUT_SETTINGS, limits=CONNECTION_LIMITS)
 
 
 def download_video_chunk(video_url: str, save_directory: str, client: Optional[httpx.Client] = None) -> str:
@@ -58,7 +58,7 @@ def download_video_chunk(video_url: str, save_directory: str, client: Optional[h
 
     owns_client = client is None
     if owns_client:
-        client = httpx.Client(timeout=TIMEOUT_SETTINGS, limits=CONNECTION_LIMITS)
+        client = httpx.Client(timeout=DOWNLOAD_TIMEOUT_SETTINGS, limits=CONNECTION_LIMITS)
 
     try:
         # Check if file exists and verify its size
@@ -78,8 +78,9 @@ def download_video_chunk(video_url: str, save_directory: str, client: Optional[h
                     f'Redownloading...'
                 )
             except Exception as e:
-                logging.warning(f'Could not verify size for {filename}, skipping check: {e}')
-                return file_path
+                logging.warning(
+                    f'Could not verify size for {filename}, forcing redownload for safety: {e}'
+                )
 
         # If we get here, we need to download (or redownload)
         with client.stream('GET', video_url) as response:

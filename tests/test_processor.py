@@ -231,3 +231,62 @@ def test_parse_presentation_timeline_uses_slide_index_changes():
 
     assert slides == ["s1.jpg", "s2.jpg"]
     assert timeline == [(0.0, 10.0, "s1.jpg"), (10.0, 20.0, "s2.jpg")]
+
+
+def test_parse_presentation_timeline_keeps_urls_from_multiple_file_references():
+    json_data = {
+        "duration": 40.0,
+        "eventLogs": [
+            {
+                "module": "presentation.update",
+                "relativeTime": 0.0,
+                "data": {
+                    "isActive": True,
+                    "slideIndex": 0,
+                    "fileReference": {
+                        "file": {
+                            "slides": [
+                                {"url": "a1.jpg"},
+                                {"url": "a2.jpg"},
+                            ]
+                        }
+                    },
+                },
+            },
+            {
+                "module": "presentation.update",
+                "relativeTime": 10.0,
+                "data": {"isActive": True, "slideIndex": 1},
+            },
+            {
+                "module": "presentation.update",
+                "relativeTime": 20.0,
+                "data": {
+                    "isActive": True,
+                    "slideIndex": 0,
+                    "fileReference": {
+                        "file": {
+                            "slides": [
+                                {"url": "b1.jpg"},
+                                {"url": "b2.jpg"},
+                            ]
+                        }
+                    },
+                },
+            },
+            {
+                "module": "presentation.update",
+                "relativeTime": 30.0,
+                "data": {"isActive": False},
+            },
+        ],
+    }
+
+    slides, timeline = parse_presentation_timeline(json_data)
+
+    assert timeline == [
+        (0.0, 10.0, "a1.jpg"),
+        (10.0, 20.0, "a2.jpg"),
+        (20.0, 30.0, "b1.jpg"),
+    ]
+    assert slides == ["a1.jpg", "a2.jpg", "b1.jpg", "b2.jpg"]

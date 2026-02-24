@@ -459,8 +459,9 @@ def parse_presentation_timeline(json_data: dict) -> Tuple[List[str], List[Tuple[
             start, current_url = None, None
     if start is not None and current_url:
         slide_timeline.append((start, float(json_data.get('duration', 0)), current_url))
-    if not slides:
-        slides = list(dict.fromkeys(u for _, _, u in slide_timeline if u))
+    timeline_urls = [u for _, _, u in slide_timeline if u]
+    if timeline_urls:
+        slides = list(dict.fromkeys(timeline_urls + [u for u in slides if u]))
     return slides, slide_timeline
 
 def _reclassify_screenshare_by_dimensions(streams: dict):
@@ -785,44 +786,83 @@ def concat_segments(segment_files: list, output_path: str):
         for s in segment_files: f.write(f"file '{s.replace(chr(92), '/')}'\n")
     _run_ffmpeg(['-y', '-f', 'concat', '-safe', '0', '-fflags', '+genpts', '-i', list_path, '-c', 'copy', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', output_path], desc='concat')
 
+
+def _resolve_output_resolution(quality: str) -> Tuple[int, int]:
+    return {"1080p": (1920, 1080), "720p": (1280, 720)}.get(quality, (1920, 1080))
+
+
+def _resolve_total_duration(json_data: dict, max_duration, start_time: float) -> float:
+    total_duration = float(json_data.get('duration', 0))
+    if max_duration:
+        total_duration = min(total_duration, start_time + max_duration)
+    if total_duration <= start_time:
+        raise ValueError(f'Invalid time window: start_time={start_time}, end_time={total_duration}')
+    return total_duration
+
+
+def _prepare_stream_clip_flags(streams: dict, hide_silent: bool):
+    for stream in streams.values():
+        for clip in stream['clips']:
+            if stream['is_screenshare']:
+                clip['_is_screenshare'] = True
+            elif hide_silent:
+                clip['_run_vad'] = True
+
+
+def _collect_slide_urls(slides: List[str], slide_timeline: Optional[list]) -> List[str]:
+    timeline_urls = [url for _, _, url in (slide_timeline or []) if url]
+    return list(dict.fromkeys([u for u in slides if u] + timeline_urls))
+
+
+def _download_slide_images(directory: str, slide_urls: List[str]) -> Dict[str, str]:
+    slide_map = {}
+    if not slide_urls:
+        return slide_map
+
+    with create_shared_client() as client:
+        for i, url in enumerate(slide_urls):
+            if STOP_REQUESTED:
+                break
+            path = os.path.join(directory, f'slide_{i:03d}.jpg')
+            if not os.path.exists(path):
+                try:
+                    response = client.get(url)
+                    response.raise_for_status()
+                    with open(path, 'wb') as file_handle:
+                        file_handle.write(response.content)
+                except Exception:
+                    continue
+            slide_map[url] = path
+    return slide_map
+
+
+def _materialize_slide_timeline(directory: str, slides: List[str], slide_timeline: Optional[list]) -> list:
+    slide_urls = _collect_slide_urls(slides, slide_timeline)
+    slide_map = _download_slide_images(directory, slide_urls)
+    return [(s, e, slide_map[url]) for s, e, url in (slide_timeline or []) if url in slide_map]
+
+
 def process_composite_video(directory: str, json_data: dict, output_path: str, max_duration=None, hide_silent: bool = False, start_time: float = 0, quality: str = "1080p"):
     global STOP_REQUESTED
     STOP_REQUESTED = False 
     process_started_ts = time.perf_counter()
     process_started_at = datetime.datetime.now()
     logging.info(f'Process started at {process_started_at.strftime("%Y-%m-%d %H:%M:%S")}')
-    res_map = {"1080p": (1920, 1080), "720p": (1280, 720)}
-    out_w, out_h = res_map.get(quality, (1920, 1080))
-    total_duration = float(json_data.get('duration', 0))
-    if max_duration: total_duration = min(total_duration, start_time + max_duration)
-    if total_duration <= start_time:
-        raise ValueError(f'Invalid time window: start_time={start_time}, end_time={total_duration}')
+    out_w, out_h = _resolve_output_resolution(quality)
+    total_duration = _resolve_total_duration(json_data, max_duration, start_time)
     logging.info(f'Target timeline: start={start_time:.1f}s, end={total_duration:.1f}s, duration={max(0.0, total_duration-start_time):.1f}s')
     chat, questions = parse_chat_and_questions(json_data)
     all_events = sorted(chat + questions, key=lambda x: x['time'])
     export_chat_files(chat, questions, directory, os.path.basename(output_path).replace('.mp4', ''))
     streams, admin_id = parse_event_logs(json_data)
     if not streams: return
-    for s in streams.values():
-        for c in s['clips']:
-            if s['is_screenshare']: c['_is_screenshare'] = True
-            elif hide_silent: c['_run_vad'] = True
+    _prepare_stream_clip_flags(streams, hide_silent)
     download_and_probe_all(streams, directory)
     logging.info(f'Files processed | elapsed {_format_elapsed(time.perf_counter() - process_started_ts)}')
     _reclassify_screenshare_by_dimensions(streams)
     slides, s_timeline = parse_presentation_timeline(json_data)
     if slides:
-        slide_map = {}
-        with create_shared_client() as client:
-            for i, url in enumerate(list(dict.fromkeys(slides))):
-                if STOP_REQUESTED: break
-                path = os.path.join(directory, f'slide_{i:03d}.jpg')
-                if not os.path.exists(path):
-                    try:
-                        resp = client.get(url); f = open(path, 'wb'); f.write(resp.content); f.close()
-                    except Exception: continue
-                slide_map[url] = path
-        s_timeline = [(s, e, slide_map[u]) for s, e, u in (s_timeline or []) if u in slide_map]
+        s_timeline = _materialize_slide_timeline(directory, slides, s_timeline)
     if STOP_REQUESTED: raise RuntimeError("interrupted")
     speech_timelines = {sk: _build_stream_speech_timeline(s) for sk, s in streams.items() if not s['is_screenshare']} if hide_silent else {}
     timeline = compute_layout_timeline(streams, total_duration, admin_id, hide_silent, speech_timelines, start_time, s_timeline, all_events)

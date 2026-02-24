@@ -10,7 +10,12 @@ from typing import Optional
 
 # Pre-import to avoid issues
 from mtslinkdownloader.webinar import fetch_webinar_data
-from mtslinkdownloader.utils import get_base_path, create_directory_if_not_exists, restore_terminal
+from mtslinkdownloader.utils import (
+    create_directory_if_not_exists,
+    get_base_path,
+    initialize_logger,
+    restore_terminal,
+)
 from mtslinkdownloader.cli import extract_ids_from_url
 from mtslinkdownloader.processor import process_composite_video, request_stop
 from mtslinkdownloader.downloader import construct_json_data_url, fetch_json_data
@@ -120,15 +125,22 @@ class App(ctk.CTk):
         self.console.grid(row=8, column=0, padx=20, pady=(0, 20), sticky="nsew")
 
         # REDIRECTION
+        self._original_stdout = sys.stdout
+        self._original_stderr = sys.stderr
         self.redirector = TextRedirector(self.console)
         sys.stdout = self.redirector
         sys.stderr = self.redirector
 
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s]: %(message)s', datefmt='%H:%M:%S', stream=sys.stderr, force=True)
+        initialize_logger(force=True, stream=sys.stderr)
         logging.getLogger("httpx").setLevel(logging.WARNING)
 
         print(f"App initialized. Base path: {get_base_path()}")
         print("Ready.\n")
+
+    def destroy(self):
+        sys.stdout = self._original_stdout
+        sys.stderr = self._original_stderr
+        super().destroy()
 
     def stop_task(self):
         self.stop_btn.configure(state="disabled", text="Stopping...")
