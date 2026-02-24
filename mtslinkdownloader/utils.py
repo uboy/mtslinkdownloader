@@ -3,6 +3,16 @@ import os
 import sys
 
 
+def normalize_log_level(level: str) -> int:
+    if isinstance(level, int):
+        return level
+    text = str(level or "INFO").strip().upper()
+    value = getattr(logging, text, None)
+    if not isinstance(value, int):
+        raise ValueError(f"Unsupported log level: {level}")
+    return value
+
+
 def get_base_path():
     """Get the path where the application is running (as script or as binary)."""
     if getattr(sys, 'frozen', False):
@@ -16,14 +26,14 @@ def get_logs_path():
     return os.path.join(logs_dir, 'mtslinkdownloader.log')
 
 
-def initialize_logger(force: bool = False, stream=None):
+def initialize_logger(force: bool = False, stream=None, level: str = "INFO"):
     root_logger = logging.getLogger()
     if root_logger.handlers and not force:
         return
 
     log_file = get_logs_path()
     logging.basicConfig(
-        level=logging.INFO,
+        level=normalize_log_level(level),
         format='%(asctime)s [%(levelname)s]: %(message)s',
         datefmt='%H:%M:%S',
         handlers=[

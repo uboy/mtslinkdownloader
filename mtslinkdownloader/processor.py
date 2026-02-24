@@ -294,7 +294,7 @@ def _safe_int(value) -> Optional[int]:
         return None
 
 
-def _extract_slide_url(data: dict, slides: List[str], current_url: Optional[str]) -> Optional[str]:
+def _extract_slide_url(data: dict, slides: List[str], current_url: Optional[str], deck_slides: Optional[List[str]] = None) -> Optional[str]:
     if not isinstance(data, dict):
         return current_url
 
@@ -314,8 +314,7 @@ def _extract_slide_url(data: dict, slides: List[str], current_url: Optional[str]
     if isinstance(ref_url, str) and ref_url.strip():
         direct_urls.append(ref_url.strip())
     for u in direct_urls:
-        if not slides or u in slides:
-            return u
+        return u
 
     idx_candidates = []
     for key in ('slideIndex', 'currentSlideIndex', 'index', 'pageIndex', 'slideNumber', 'page'):
@@ -330,11 +329,18 @@ def _extract_slide_url(data: dict, slides: List[str], current_url: Optional[str]
                 if idx is not None:
                     idx_candidates.append(idx)
 
+    lookup_sources = []
+    if deck_slides:
+        lookup_sources.append(deck_slides)
+    if slides:
+        lookup_sources.append(slides)
+
     for idx in idx_candidates:
-        if slides and 0 <= idx < len(slides):
-            return slides[idx]
-        if slides and 1 <= idx <= len(slides):
-            return slides[idx - 1]
+        for source in lookup_sources:
+            if 0 <= idx < len(source):
+                return source[idx]
+            if 1 <= idx <= len(source):
+                return source[idx - 1]
 
     if current_url:
         return current_url
@@ -428,23 +434,63 @@ def parse_presentation_timeline(json_data: dict) -> Tuple[List[str], List[Tuple[
     pres_events = [e for e in event_logs if str(e.get('module', '')).startswith('presentation.')]
     slides, slide_timeline = [], []
     if not pres_events: return slides, slide_timeline
-    for event in pres_events:
-        slide_list = event.get('data', {}).get('fileReference', {}).get('file', {}).get('slides', [])
-        if slide_list:
-            slides = [s.get('url', '') for s in slide_list if s.get('url')]
-            if slides:
-                break
+
+    deck_slides_by_key: Dict[str, List[str]] = {}
+    active_deck_key = None
+
+    def _deck_key_from_data(data: dict) -> Optional[str]:
+        if not isinstance(data, dict):
+            return None
+        file_reference = data.get('fileReference')
+        if not isinstance(file_reference, dict):
+            return None
+        file_node = file_reference.get('file')
+        if isinstance(file_node, dict):
+            for key in ('id', 'uuid', 'hash', 'url'):
+                value = file_node.get(key)
+                if value is not None:
+                    text = str(value).strip()
+                    if text:
+                        return text
+        for key in ('id', 'uuid', 'hash'):
+            value = file_reference.get(key)
+            if value is not None:
+                text = str(value).strip()
+                if text:
+                    return text
+        return None
+
+    def _slides_from_data(data: dict) -> List[str]:
+        if not isinstance(data, dict):
+            return []
+        slide_list = data.get('fileReference', {}).get('file', {}).get('slides', [])
+        if not isinstance(slide_list, list):
+            return []
+        return [s.get('url', '') for s in slide_list if isinstance(s, dict) and s.get('url')]
+
     start, current_url = None, None
     for event in pres_events:
         d = event.get('data', {})
         t = event.get('relativeTime', 0)
-        slide_list = d.get('fileReference', {}).get('file', {}).get('slides', [])
-        if slide_list:
-            new_slides = [s.get('url', '') for s in slide_list if s.get('url')]
-            if new_slides:
+
+        deck_key = _deck_key_from_data(d)
+        new_slides = _slides_from_data(d)
+        if new_slides and not deck_key:
+            deck_key = 'slides:' + '|'.join(new_slides)
+        if new_slides:
+            if deck_key:
+                deck_slides_by_key[deck_key] = new_slides
+            if not slides:
                 slides = new_slides
+            else:
+                slides = list(dict.fromkeys(slides + new_slides))
+
+        if deck_key:
+            active_deck_key = deck_key
+
+        active_deck_slides = deck_slides_by_key.get(active_deck_key, []) if active_deck_key else []
         is_active = bool(d.get('isActive', True))
-        new_url = _extract_slide_url(d, slides, current_url)
+        new_url = _extract_slide_url(d, slides, current_url, deck_slides=active_deck_slides)
         if is_active:
             if start is None:
                 start = t
@@ -866,6 +912,77 @@ def _materialize_slide_timeline(directory: str, slides: List[str], slide_timelin
     return [(s, e, slide_map[url]) for s, e, url in (slide_timeline or []) if url in slide_map]
 
 
+def _timeline_coverage(intervals: Optional[list], start_time: float, end_time: float) -> float:
+    if not intervals or end_time <= start_time:
+        return 0.0
+    total = 0.0
+    for start, end in intervals:
+        overlap = min(float(end), end_time) - max(float(start), start_time)
+        if overlap > 0:
+            total += overlap
+    return total
+
+
+def _log_source_switch_diagnostics(
+    json_data: dict,
+    streams: dict,
+    raw_slide_timeline: Optional[list],
+    start_time: float,
+    total_duration: float,
+):
+    pres_events = [e for e in json_data.get('eventLogs', []) if str(e.get('module', '')).startswith('presentation.')]
+    slide_intervals = [(s, e) for s, e, _ in (raw_slide_timeline or [])]
+    slide_coverage = _timeline_coverage(slide_intervals, start_time, total_duration)
+
+    screenshare_intervals = []
+    for stream in streams.values():
+        if not stream.get('is_screenshare'):
+            continue
+        for clip in stream.get('clips', []):
+            clip_start = float(clip.get('relative_time', 0.0))
+            clip_end = clip_start + max(0.0, float(clip.get('duration', 0.0)))
+            if clip_end > clip_start:
+                screenshare_intervals.append((clip_start, clip_end))
+
+    screenshare_coverage = _timeline_coverage(screenshare_intervals, start_time, total_duration)
+    overlap = 0.0
+    for s_start, s_end in screenshare_intervals:
+        for p_start, p_end in slide_intervals:
+            overlap += max(0.0, min(s_end, p_end, total_duration) - max(s_start, p_start, start_time))
+
+    file_reference_changes = 0
+    known_file_refs = set()
+    for event in pres_events:
+        data = event.get('data', {})
+        file_reference = data.get('fileReference', {}) if isinstance(data, dict) else {}
+        file_id = file_reference.get('file', {}).get('id') or file_reference.get('id')
+        if file_id:
+            known_file_refs.add(str(file_id))
+            file_reference_changes = max(file_reference_changes, len(known_file_refs))
+
+    logging.info(
+        'Source diagnostics: screenshare_coverage=%.1fs, slide_coverage=%.1fs, overlap=%.1fs, presentation_events=%d, presentation_files=%d',
+        screenshare_coverage,
+        slide_coverage,
+        overlap,
+        len(pres_events),
+        file_reference_changes,
+    )
+
+    if pres_events and not raw_slide_timeline:
+        logging.warning('Presentation events exist but no slide timeline could be built; slide sync can be inaccurate.')
+    if overlap > 30.0:
+        logging.warning(
+            'Detected %.1fs where presentation and screenshare are both active. Presenter may switch visible source; timing can drift without explicit stage-switch events.',
+            overlap,
+        )
+    if file_reference_changes >= 2:
+        logging.warning(
+            'Detected %d different presentation file references. Source switches between slide decks are possible; verify timeline around switch points.',
+            file_reference_changes,
+        )
+
+
 def process_composite_video(directory: str, json_data: dict, output_path: str, max_duration=None, hide_silent: bool = False, start_time: float = 0, quality: str = "1080p"):
     global STOP_REQUESTED
     STOP_REQUESTED = False 
@@ -885,13 +1002,32 @@ def process_composite_video(directory: str, json_data: dict, output_path: str, m
     logging.info(f'Files processed | elapsed {_format_elapsed(time.perf_counter() - process_started_ts)}')
     _reclassify_screenshare_by_dimensions(streams)
     slides, s_timeline = parse_presentation_timeline(json_data)
+    _log_source_switch_diagnostics(json_data, streams, s_timeline, start_time, total_duration)
     if slides:
         s_timeline = _materialize_slide_timeline(directory, slides, s_timeline)
+    missing_slide_images = sum(1 for _, _, path in s_timeline if not os.path.exists(path)) if s_timeline else 0
+    if missing_slide_images:
+        logging.warning('Slide timeline contains %d missing local slide images; these intervals may render as black.', missing_slide_images)
     if STOP_REQUESTED: raise RuntimeError("interrupted")
     speech_timelines = {sk: _build_stream_speech_timeline(s) for sk, s in streams.items() if not s['is_screenshare']} if hide_silent else {}
     timeline = compute_layout_timeline(streams, total_duration, admin_id, hide_silent, speech_timelines, start_time, s_timeline, all_events)
     if not timeline: return
     logging.info(f'Timeline ready: {len(timeline)} segments | elapsed {_format_elapsed(time.perf_counter() - process_started_ts)}')
+    if logging.getLogger().isEnabledFor(logging.DEBUG):
+        for i, segment in enumerate(timeline[:20]):
+            main_source = 'screen' if segment.get('screenshare') else ('slide' if segment.get('slide_image') else 'none')
+            logging.debug(
+                'seg[%d] %.2f-%.2f source=%s cameras=%d audio=%d chat=%d',
+                i,
+                segment['start'],
+                segment['end'],
+                main_source,
+                len(segment.get('cameras', [])),
+                len(segment.get('audio_sources', [])),
+                segment.get('chat_version', 0),
+            )
+        if len(timeline) > 20:
+            logging.debug('... %d more segments omitted from debug output', len(timeline) - 20)
     if hide_silent:
         active = {streams[sk]['user_name'] for sk, t in speech_timelines.items() if t}
         logging.info(f'Active participants (with speech): {len(active)}')

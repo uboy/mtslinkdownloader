@@ -42,6 +42,7 @@ def test_main_returns_error_for_invalid_url(monkeypatch):
         "parse_arguments",
         lambda: argparse.Namespace(
             url="not-a-valid-url",
+            log_level="INFO",
             session_id=None,
             hide_silent=False,
             max_duration=None,
@@ -66,6 +67,7 @@ def test_main_returns_zero_and_forwards_args(monkeypatch):
         "parse_arguments",
         lambda: argparse.Namespace(
             url="https://my.mts-link.ru/1/2/record-new/123/record-file/456",
+            log_level="DEBUG",
             session_id="sid",
             hide_silent=True,
             max_duration=120.0,
@@ -98,6 +100,7 @@ def test_main_returns_error_when_fetch_fails(monkeypatch):
         "parse_arguments",
         lambda: argparse.Namespace(
             url="https://my.mts-link.ru/1/2/record-new/123",
+            log_level="INFO",
             session_id=None,
             hide_silent=False,
             max_duration=None,
@@ -108,3 +111,31 @@ def test_main_returns_error_when_fetch_fails(monkeypatch):
     monkeypatch.setattr(cli, "fetch_webinar_data", lambda **_: None)
 
     assert cli.main() == 1
+
+
+def test_main_initializes_logger_with_selected_level(monkeypatch):
+    calls = {}
+
+    monkeypatch.setattr(
+        cli,
+        "parse_arguments",
+        lambda: argparse.Namespace(
+            url="https://my.mts-link.ru/1/2/record-new/123",
+            log_level="ERROR",
+            session_id=None,
+            hide_silent=False,
+            max_duration=None,
+            start_time=0,
+            quality="1080p",
+        ),
+    )
+
+    def fake_initialize_logger(force=False, level="INFO"):
+        calls["force"] = force
+        calls["level"] = level
+
+    monkeypatch.setattr(cli, "initialize_logger", fake_initialize_logger)
+    monkeypatch.setattr(cli, "fetch_webinar_data", lambda **_: 1)
+
+    assert cli.main() == 0
+    assert calls == {"force": False, "level": "ERROR"}

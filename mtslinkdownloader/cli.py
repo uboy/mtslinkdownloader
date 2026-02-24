@@ -24,6 +24,12 @@ def parse_arguments():
         )
     )
     parser.add_argument(
+        '--log-level',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        default='INFO',
+        help='Logging verbosity level (default: INFO).'
+    )
+    parser.add_argument(
         '--session-id',
         help='[Optional] sessionId token for accessing private recordings.'
     )
@@ -64,11 +70,10 @@ def extract_ids_from_url(url: str) -> Tuple[Optional[str], Optional[str]]:
 
 
 def main():
-    initialize_logger(force=False)
+    args = parse_arguments()
+    initialize_logger(force=False, level=args.log_level)
     # Silence httpx logs to keep progress bars readable
     logging.getLogger("httpx").setLevel(logging.WARNING)
-
-    args = parse_arguments()
 
     event_sessions, record_id = extract_ids_from_url(args.url)
     if event_sessions is None:

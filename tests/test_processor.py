@@ -1,4 +1,5 @@
 from mtslinkdownloader.processor import (
+    _log_source_switch_diagnostics,
     compute_layout_timeline,
     _build_chat_overlay_text,
     _format_elapsed,
@@ -359,3 +360,97 @@ def test_parse_presentation_timeline_keeps_urls_from_multiple_file_references():
         (20.0, 30.0, "b1.jpg"),
     ]
     assert slides == ["a1.jpg", "a2.jpg", "b1.jpg", "b2.jpg"]
+
+
+def test_parse_presentation_timeline_switches_deck_on_direct_url_before_slides_list_update():
+    json_data = {
+        "duration": 30.0,
+        "eventLogs": [
+            {
+                "module": "presentation.update",
+                "relativeTime": 0.0,
+                "data": {
+                    "isActive": True,
+                    "slideIndex": 0,
+                    "fileReference": {
+                        "id": "deck-a",
+                        "file": {
+                            "slides": [
+                                {"url": "a1.jpg"},
+                                {"url": "a2.jpg"},
+                            ]
+                        },
+                    },
+                },
+            },
+            {
+                "module": "presentation.update",
+                "relativeTime": 10.0,
+                "data": {
+                    "isActive": True,
+                    "currentSlideUrl": "b1.jpg",
+                },
+            },
+            {
+                "module": "presentation.update",
+                "relativeTime": 15.0,
+                "data": {
+                    "isActive": True,
+                    "slideIndex": 0,
+                    "fileReference": {
+                        "id": "deck-b",
+                        "file": {
+                            "slides": [
+                                {"url": "b1.jpg"},
+                                {"url": "b2.jpg"},
+                            ]
+                        },
+                    },
+                },
+            },
+            {
+                "module": "presentation.update",
+                "relativeTime": 20.0,
+                "data": {
+                    "isActive": False,
+                },
+            },
+        ],
+    }
+
+    slides, timeline = parse_presentation_timeline(json_data)
+
+    assert timeline == [
+        (0.0, 10.0, "a1.jpg"),
+        (10.0, 20.0, "b1.jpg"),
+    ]
+    assert slides == ["a1.jpg", "b1.jpg", "a2.jpg", "b2.jpg"]
+
+
+def test_source_switch_diagnostics_warns_when_presentation_and_screenshare_overlap(caplog):
+    streams = {
+        ("screen", True): {
+            "is_screenshare": True,
+            "clips": [
+                {"relative_time": 0.0, "duration": 120.0},
+            ],
+        }
+    }
+    json_data = {
+        "eventLogs": [
+            {"module": "presentation.update", "relativeTime": 0.0, "data": {"isActive": True}},
+            {"module": "presentation.update", "relativeTime": 90.0, "data": {"isActive": False}},
+        ]
+    }
+    slide_timeline = [(0.0, 90.0, "slide.jpg")]
+
+    with caplog.at_level("WARNING"):
+        _log_source_switch_diagnostics(
+            json_data=json_data,
+            streams=streams,
+            raw_slide_timeline=slide_timeline,
+            start_time=0.0,
+            total_duration=120.0,
+        )
+
+    assert any("both active" in message for message in caplog.messages)

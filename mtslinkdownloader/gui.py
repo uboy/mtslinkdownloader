@@ -74,7 +74,7 @@ class App(ctk.CTk):
 
         self.settings_frame = ctk.CTkFrame(self)
         self.settings_frame.grid(row=3, column=0, padx=20, pady=10, sticky="ew")
-        self.settings_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
+        self.settings_frame.grid_columnconfigure((0, 1, 2, 3, 4), weight=1)
 
         self.sid_label = ctk.CTkLabel(self.settings_frame, text="Session ID (Optional):")
         self.sid_label.grid(row=0, column=0, padx=10, pady=(5, 0), sticky="w")
@@ -97,6 +97,16 @@ class App(ctk.CTk):
         self.quality_var = ctk.StringVar(value="FULL HD (1920x1080)")
         self.quality_menu = ctk.CTkOptionMenu(self.settings_frame, values=["FULL HD (1920x1080)", "HD (1280x720)"], variable=self.quality_var)
         self.quality_menu.grid(row=1, column=3, padx=10, pady=(0, 10), sticky="ew")
+
+        self.log_label = ctk.CTkLabel(self.settings_frame, text="Log level:")
+        self.log_label.grid(row=0, column=4, padx=10, pady=(5, 0), sticky="w")
+        self.log_level_var = ctk.StringVar(value="INFO")
+        self.log_level_menu = ctk.CTkOptionMenu(
+            self.settings_frame,
+            values=["DEBUG", "INFO", "WARNING", "ERROR"],
+            variable=self.log_level_var,
+        )
+        self.log_level_menu.grid(row=1, column=4, padx=10, pady=(0, 10), sticky="ew")
 
         self.hide_silent = ctk.CTkCheckBox(self, text="Aggressive optimization: Hide non-speaking participants")
         self.hide_silent.select() 
@@ -131,7 +141,7 @@ class App(ctk.CTk):
         sys.stdout = self.redirector
         sys.stderr = self.redirector
 
-        initialize_logger(force=True, stream=sys.stderr)
+        initialize_logger(force=True, stream=sys.stderr, level=self.log_level_var.get())
         logging.getLogger("httpx").setLevel(logging.WARNING)
 
         print(f"App initialized. Base path: {get_base_path()}")
@@ -163,6 +173,7 @@ class App(ctk.CTk):
             return
             
         quality = "1080p" if "1920" in self.quality_var.get() else "720p"
+        initialize_logger(force=True, stream=sys.stderr, level=self.log_level_var.get())
         thread = threading.Thread(target=self.run_process, args=(url, s_id, t_start, t_max, self.hide_silent.get(), quality), daemon=True)
         thread.start()
 
@@ -190,6 +201,7 @@ class App(ctk.CTk):
             print(f"  Start offset: {t_start} seconds")
             print(f"  Max duration: {t_max if t_max else 'Full record'} seconds")
             print(f"  Quality:      {quality.upper()}")
+            print(f"  Log level:    {self.log_level_var.get()}")
             print(f"  Session ID:   {'Set' if s_id else 'Not set'}")
             print(f"  Optimization: {'Aggressive (Hide Silent)' if h_silent else 'Standard'}")
             print("-" * 40)
