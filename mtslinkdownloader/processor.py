@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import datetime
 import time
+import textwrap
 from bisect import bisect_right
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -163,19 +164,43 @@ def _is_lecturer_stream(stream: dict, admin_user_id: Optional[int]) -> bool:
     return bool(admin_user_id and user_id and user_id == admin_user_id)
 
 
-def _build_chat_overlay_text(events: Optional[list], t: float, max_lines: int = 6) -> str:
+def _format_hhmmss(seconds: float) -> str:
+    total = max(0, int(seconds))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _build_chat_overlay_text(events: Optional[list], t: float, max_lines: int = 8, wrap_chars: int = 40) -> str:
     if not events:
-        return "CHAT: no messages yet"
+        return "[CHAT 00:00:00]\nno messages yet"
     visible = [e for e in events if e.get('time', 0) <= t]
     if not visible:
-        return "CHAT: no messages yet"
-    lines = []
-    for e in visible[-max_lines:]:
+        return "[CHAT 00:00:00]\nno messages yet"
+    blocks = []
+    for e in visible:
         kind = str(e.get('type', 'CHAT')).upper()
-        user = str(e.get('user', 'System')).replace('\n', ' ').strip() or 'System'
+        stamp = _format_hhmmss(float(e.get('time', 0)))
+        header = f"[{kind} {stamp}]"
         text = str(e.get('text', '')).replace('\n', ' ').strip()
-        lines.append(f"[{kind}] {user}: {text}")
-    return '\n'.join(lines)
+        wrapped_body = textwrap.wrap(text, width=max(16, wrap_chars), break_long_words=True, break_on_hyphens=False)
+        if not wrapped_body:
+            wrapped_body = ["(empty)"]
+        blocks.append([header] + wrapped_body)
+
+    selected_lines = []
+    lines_left = max(2, max_lines)
+    for block in reversed(blocks):
+        need = len(block)
+        if need <= lines_left:
+            selected_lines = block + selected_lines
+            lines_left -= need
+            continue
+        if not selected_lines:
+            selected_lines = block[:lines_left]
+            lines_left = 0
+        break
+    return '\n'.join(selected_lines)
 
 
 def _escape_drawtext_path(path: str) -> str:
@@ -476,6 +501,8 @@ def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str,
     t_start, duration = segment['start'], segment['end'] - segment['start']
     inputs, v_inputs, a_inputs, cur_idx = [], [], [], 0
     main_w = (int(out_w * 0.8333) // 2) * 2; sidebar_w = out_w - main_w; sidebar_h = out_h // 4
+    cam_w = max(120, (int(sidebar_w * 0.84) // 2) * 2)
+    cam_x = main_w + (sidebar_w - cam_w) // 2
     cam_visual_count = 0
     max_cam_slots = 3
     audio_input_by_stream = {}
@@ -519,7 +546,7 @@ def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str,
                 _append_audio_input(cur_idx)
             cur_idx += 1
         elif clip['has_audio']:
-            img_path = _create_name_placeholder(user_name, os.path.dirname(output_path), sidebar_w, sidebar_h)
+            img_path = _create_name_placeholder(user_name, os.path.dirname(output_path), cam_w, sidebar_h)
             if img_path and cam_visual_count < max_cam_slots:
                 inputs.extend(['-loop', '1', '-framerate', str(OUTPUT_FPS), '-t', f'{duration:.3f}', '-i', img_path])
                 v_inputs.append((cur_idx, 'cam', user_name))
@@ -554,16 +581,18 @@ def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str,
             filter_parts.append(f'[{idx}:v]{pts}scale={main_w}:{out_h}:force_original_aspect_ratio=decrease,pad=max({main_w}\,iw):max({out_h}\,ih):(ow-iw)/2:(oh-ih)/2:black,setsar=1,scale={main_w}:{out_h}[m_v]')
             filter_parts.append(f'[{curr_v}][m_v]overlay=0:0:eof_action=repeat[v{ov_idx}]')
         elif type == 'main_no_pts':
-            filter_parts.append(f'[{idx}:v]scale={sidebar_w}:{sidebar_h},setsar=1[c{idx}]')
-            filter_parts.append(f'[{curr_v}][c{idx}]overlay={main_w}:{cam_count*sidebar_h}:eof_action=repeat[v{ov_idx}]')
+            filter_parts.append(f'[{idx}:v]scale={cam_w}:{sidebar_h},setsar=1[c{idx}]')
+            filter_parts.append(f'[{curr_v}][c{idx}]overlay={cam_x}:{cam_count*sidebar_h}:eof_action=repeat[v{ov_idx}]')
             cam_count += 1
         else:
-            filter_parts.append(f'[{idx}:v]scale={sidebar_w}:{sidebar_h}:force_original_aspect_ratio=decrease,pad=max({sidebar_w}\,iw):max({sidebar_h}\,ih):(ow-iw)/2:(oh-ih)/2:black,setsar=1,scale={sidebar_w}:{sidebar_h}[c{idx}]')
-            filter_parts.append(f'[{curr_v}][c{idx}]overlay={main_w}:{cam_count*sidebar_h}:eof_action=repeat[v{ov_idx}]')
+            filter_parts.append(f'[{idx}:v]scale={cam_w}:{sidebar_h}:force_original_aspect_ratio=decrease,pad=max({cam_w}\,iw):max({sidebar_h}\,ih):(ow-iw)/2:(oh-ih)/2:black,setsar=1,scale={cam_w}:{sidebar_h}[c{idx}]')
+            filter_parts.append(f'[{curr_v}][c{idx}]overlay={cam_x}:{cam_count*sidebar_h}:eof_action=repeat[v{ov_idx}]')
             cam_count += 1
         curr_v, ov_idx = f'v{ov_idx}', ov_idx + 1
 
-    chat_txt = _build_chat_overlay_text(events, t_start)
+    chat_wrap_chars = max(20, int((sidebar_w - 22) / 7.3))
+    chat_max_lines = max(4, int((sidebar_h - 44) / 20))
+    chat_txt = _build_chat_overlay_text(events, t_start, max_lines=chat_max_lines, wrap_chars=chat_wrap_chars)
     chat_path = os.path.join(tmpdir, f'chat_{seg_index:05d}.txt')
     with open(chat_path, 'w', encoding='utf-8') as f:
         f.write(chat_txt)
