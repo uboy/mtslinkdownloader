@@ -1,3 +1,9 @@
+import subprocess
+from types import SimpleNamespace
+
+import pytest
+
+from mtslinkdownloader import processor
 from mtslinkdownloader.processor import (
     _log_source_switch_diagnostics,
     compute_layout_timeline,
@@ -454,3 +460,19 @@ def test_source_switch_diagnostics_warns_when_presentation_and_screenshare_overl
         )
 
     assert any("both active" in message for message in caplog.messages)
+
+
+def test_run_ffmpeg_treats_signal_2_as_interrupted(monkeypatch):
+    monkeypatch.setattr(processor, "STOP_REQUESTED", False)
+    monkeypatch.setattr(processor, "_get_ffmpeg", lambda: "ffmpeg")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=255,
+            stderr="Exiting normally, received signal 2.",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="interrupted"):
+        processor._run_ffmpeg(["-version"], desc="probe")

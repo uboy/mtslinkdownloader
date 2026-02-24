@@ -79,13 +79,31 @@ def _probe_media(file_path: str) -> dict:
 def _run_ffmpeg(args: list, desc: str = "", timeout: int = None):
     if STOP_REQUESTED: raise RuntimeError('interrupted')
     cmd = [_get_ffmpeg()] + args
+
+    def _was_interrupted(returncode: int, stderr_text: str) -> bool:
+        if returncode in (2, 130, -2):
+            return True
+        text = (stderr_text or '').lower()
+        interrupt_markers = (
+            'received signal 2',
+            'immediate exit requested',
+            'exiting normally, received signal',
+            'signal 2',
+            'signal 15',
+        )
+        return any(marker in text for marker in interrupt_markers)
+
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if result.returncode != 0:
-            if result.returncode in (2, 130, -2) or STOP_REQUESTED: raise RuntimeError('interrupted')
+            if STOP_REQUESTED or _was_interrupted(result.returncode, result.stderr):
+                raise RuntimeError('interrupted')
             err_msg = result.stderr[-1000:] if result.stderr else "No stderr"
             logging.error(f'FFmpeg fail ({desc}): {err_msg}')
             raise RuntimeError(f'ffmpeg failed: {desc}')
+    except KeyboardInterrupt:
+        request_stop()
+        raise RuntimeError('interrupted')
     except subprocess.TimeoutExpired: raise RuntimeError(f'timeout: {desc}')
 
 def _detect_black_video(file_path: str, duration: float) -> bool:
@@ -832,7 +850,11 @@ def render_all_segments(timeline: list, streams: dict, tmpdir: str, out_w: int =
                         if res: segment_files[idx] = res
                         else: raise RuntimeError(f"Seg {idx} fail")
                     except Exception as e:
-                        if 'interrupted' not in str(e): logging.error(f'Critical: Segment {idx} failed: {e}')
+                        interrupted = 'interrupted' in str(e).lower()
+                        if interrupted:
+                            STOP_REQUESTED = True
+                        elif not STOP_REQUESTED:
+                            logging.error(f'Critical: Segment {idx} failed: {e}')
                         executor.shutdown(wait=False, cancel_futures=True); raise
                     pbar.update(1)
                     completed += 1

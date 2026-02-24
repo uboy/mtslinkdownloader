@@ -229,6 +229,39 @@ def test_render_all_segments_returns_results_in_timeline_order(tmp_path, monkeyp
     ]
 
 
+def test_render_all_segments_interrupted_suppresses_critical_error_log(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(processor, "STOP_REQUESTED", False)
+    monkeypatch.setattr(processor, "_detect_best_encoder", lambda: ("libx264", "ultrafast", 1))
+
+    class _DummyTqdm:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def update(self, _n):
+            return None
+
+    monkeypatch.setattr(processor.tqdm, "tqdm", _DummyTqdm)
+    monkeypatch.setattr(
+        processor,
+        "_render_segment",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("interrupted")),
+    )
+
+    timeline = [{"start": 0.0, "end": 1.0}]
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(RuntimeError, match="interrupted"):
+            processor.render_all_segments(timeline, {}, str(tmp_path))
+
+    assert processor.STOP_REQUESTED is True
+    assert not any("Critical: Segment" in m for m in caplog.messages)
+
+
 def test_tqdm_console_logging_temporarily_replaces_console_handlers(tmp_path):
     logger = logging.getLogger("mtslinkdownloader.test.tqdm_context")
     logger.propagate = False
