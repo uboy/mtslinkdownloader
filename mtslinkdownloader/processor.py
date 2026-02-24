@@ -135,6 +135,17 @@ def _has_speech_at(timeline: list, t: float) -> bool:
         if s > t: break
     return False
 
+
+def _speech_overlap_duration(timeline: list, start: float, end: float) -> float:
+    total = 0.0
+    for s, e in timeline:
+        if s >= end:
+            break
+        overlap = min(e, end) - max(s, start)
+        if overlap > 0:
+            total += overlap
+    return total
+
 def _create_proxy_clip(file_path: str, threads: int = 2) -> str:
     if STOP_REQUESTED: return file_path
     proxy_path = file_path.replace('.mp4', '_proxy.mp4')
@@ -272,6 +283,64 @@ def _extract_user_name(data: dict, default_name: str) -> str:
             return c.strip()
     return default_name
 
+
+def _safe_int(value) -> Optional[int]:
+    try:
+        if isinstance(value, bool):
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def _extract_slide_url(data: dict, slides: List[str], current_url: Optional[str]) -> Optional[str]:
+    if not isinstance(data, dict):
+        return current_url
+
+    direct_urls = []
+    for key in ('url', 'slideUrl', 'currentSlideUrl', 'imageUrl'):
+        v = data.get(key)
+        if isinstance(v, str) and v.strip():
+            direct_urls.append(v.strip())
+    for node_key in ('slide', 'currentSlide', 'presentation', 'page'):
+        node = data.get(node_key)
+        if isinstance(node, dict):
+            for key in ('url', 'slideUrl', 'imageUrl'):
+                v = node.get(key)
+                if isinstance(v, str) and v.strip():
+                    direct_urls.append(v.strip())
+    ref_url = data.get('fileReference', {}).get('file', {}).get('currentSlide', {}).get('url')
+    if isinstance(ref_url, str) and ref_url.strip():
+        direct_urls.append(ref_url.strip())
+    for u in direct_urls:
+        if not slides or u in slides:
+            return u
+
+    idx_candidates = []
+    for key in ('slideIndex', 'currentSlideIndex', 'index', 'pageIndex', 'slideNumber', 'page'):
+        idx = _safe_int(data.get(key))
+        if idx is not None:
+            idx_candidates.append(idx)
+    for node_key in ('slide', 'currentSlide', 'presentation', 'page'):
+        node = data.get(node_key)
+        if isinstance(node, dict):
+            for key in ('index', 'slideIndex', 'currentSlideIndex', 'number', 'page', 'slideNumber'):
+                idx = _safe_int(node.get(key))
+                if idx is not None:
+                    idx_candidates.append(idx)
+
+    for idx in idx_candidates:
+        if slides and 0 <= idx < len(slides):
+            return slides[idx]
+        if slides and 1 <= idx <= len(slides):
+            return slides[idx - 1]
+
+    if current_url:
+        return current_url
+    if slides:
+        return slides[0]
+    return None
+
 # ─── Parsing ─────────────────────────────────────────────────────────────
 
 def parse_chat_and_questions(json_data: dict) -> Tuple[list, list]:
@@ -355,22 +424,43 @@ def parse_event_logs(json_data: dict) -> Tuple[dict, Optional[int]]:
 
 def parse_presentation_timeline(json_data: dict) -> Tuple[List[str], List[Tuple[float, float, str]]]:
     event_logs = json_data.get('eventLogs', [])
-    pres_events = [e for e in event_logs if e.get('module') == 'presentation.update']
+    pres_events = [e for e in event_logs if str(e.get('module', '')).startswith('presentation.')]
     slides, slide_timeline = [], []
     if not pres_events: return slides, slide_timeline
     for event in pres_events:
         slide_list = event.get('data', {}).get('fileReference', {}).get('file', {}).get('slides', [])
-        if slide_list: slides = [s.get('url', '') for s in slide_list if s.get('url')]; break
-    if not slides: return slides, slide_timeline
-    idx, start, url = 0, None, None
+        if slide_list:
+            slides = [s.get('url', '') for s in slide_list if s.get('url')]
+            if slides:
+                break
+    start, current_url = None, None
     for event in pres_events:
-        d = event.get('data', {}); t = event.get('relativeTime', 0)
-        if d.get('isActive', False):
-            if start is not None: slide_timeline.append((start, t, url))
-            url = slides[idx % len(slides)]; start = t; idx += 1
+        d = event.get('data', {})
+        t = event.get('relativeTime', 0)
+        slide_list = d.get('fileReference', {}).get('file', {}).get('slides', [])
+        if slide_list:
+            new_slides = [s.get('url', '') for s in slide_list if s.get('url')]
+            if new_slides:
+                slides = new_slides
+        is_active = bool(d.get('isActive', True))
+        new_url = _extract_slide_url(d, slides, current_url)
+        if is_active:
+            if start is None:
+                start = t
+                current_url = new_url
+            elif new_url and new_url != current_url:
+                if current_url:
+                    slide_timeline.append((start, t, current_url))
+                start = t
+                current_url = new_url
         elif start is not None:
-            slide_timeline.append((start, t, url)); start = None; url = None
-    if start is not None: slide_timeline.append((start, float(json_data.get('duration', 0)), url))
+            if current_url:
+                slide_timeline.append((start, t, current_url))
+            start, current_url = None, None
+    if start is not None and current_url:
+        slide_timeline.append((start, float(json_data.get('duration', 0)), current_url))
+    if not slides:
+        slides = list(dict.fromkeys(u for _, _, u in slide_timeline if u))
     return slides, slide_timeline
 
 def _reclassify_screenshare_by_dimensions(streams: dict):
@@ -460,9 +550,14 @@ def compute_layout_timeline(streams: dict, total_duration: float, admin_user_id:
         if p - filtered[-1] >= MIN_SEGMENT_DURATION or p == total_duration: filtered.append(p)
     segments = []
     for i in range(len(filtered)-1):
-        t_s, t_e = filtered[i], filtered[i+1]; t_m = (t_s + t_e) / 2; active = []
+        t_s, t_e = filtered[i], filtered[i+1]
+        t_probe = min(t_e - 0.001, t_s + min(0.2, max(0.01, (t_e - t_s) / 2)))
+        t_m = (t_s + t_e) / 2
+        active = []
         for sk, s in streams.items():
-            clip, seek = _find_clip_at_time(s, t_m)
+            clip, seek = _find_clip_at_time(s, t_probe)
+            if not clip:
+                clip, seek = _find_clip_at_time(s, t_m)
             if clip: active.append((sk, clip, seek))
         screenshare = next((a for a in active if streams[a[0]]['is_screenshare']), None)
         all_cameras = [a for a in active if not streams[a[0]]['is_screenshare']]
@@ -470,15 +565,17 @@ def compute_layout_timeline(streams: dict, total_duration: float, admin_user_id:
         lecturer = next((c for c in all_cameras if _is_lecturer_stream(streams[c[0]], admin_user_id)), None)
         cameras = list(all_cameras)
         if hide_silent and speech_timelines:
-            speaking = [c for c in all_cameras if _has_speech_at(speech_timelines.get(c[0], []), t_m)]
+            speaking_overlap = {c[0]: _speech_overlap_duration(speech_timelines.get(c[0], []), t_s, t_e) for c in all_cameras}
+            speaking = [c for c in all_cameras if speaking_overlap.get(c[0], 0.0) > 0.05]
+            speaking.sort(key=lambda c: speaking_overlap.get(c[0], 0.0), reverse=True)
             cameras = ([lecturer] if lecturer else []) + [c for c in speaking if not lecturer or c[0] != lecturer[0]]
         cameras = [c for c in cameras if c[1]['has_video'] or c[1]['has_audio']]
         if lecturer and not any(c[0] == lecturer[0] for c in cameras):
             if lecturer[1]['has_video'] or lecturer[1]['has_audio']:
                 cameras = [lecturer] + cameras
         cameras.sort(key=lambda c: (0 if _is_lecturer_stream(streams[c[0]], admin_user_id) else 1, streams[c[0]].get('user_name', '').lower()))
-        slide = next((path for s_s, s_e, path in (slide_timeline or []) if s_s <= t_m < s_e), None) if not screenshare else None
-        chat_version = bisect_right(event_times, t_m)
+        slide = next((path for s_s, s_e, path in (slide_timeline or []) if s_s <= t_probe < s_e), None) if not screenshare else None
+        chat_version = bisect_right(event_times, t_probe)
         segments.append({'start': t_s, 'end': t_e, 'screenshare': screenshare, 'cameras': cameras, 'audio_sources': audio_sources, 'slide_image': slide, 'chat_version': chat_version})
     if not segments: return []
     merged = [segments[0]]

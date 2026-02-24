@@ -3,6 +3,7 @@ from mtslinkdownloader.processor import (
     _build_chat_overlay_text,
     _format_elapsed,
     parse_chat_and_questions,
+    parse_presentation_timeline,
 )
 
 
@@ -159,3 +160,74 @@ def test_parse_chat_and_questions_supports_generic_chat_and_nested_text():
     assert questions == [
         {"time": 18.0, "user": "Bob", "text": "Question text", "type": "Q&A"}
     ]
+
+
+def test_compute_layout_uses_speech_overlap_not_midpoint_only():
+    lecturer_key = ("lecturer", False)
+    speaker_key = ("speaker", False)
+    streams = {
+        lecturer_key: _make_stream(is_admin=True, user_id=1, user_name="Lecturer"),
+        speaker_key: _make_stream(is_admin=False, user_id=2, user_name="Speaker"),
+    }
+    streams[lecturer_key]["clips"].append(_make_clip(start=0.0, duration=10.0, file_path="lecturer.mp4"))
+    streams[speaker_key]["clips"].append(_make_clip(start=0.0, duration=10.0, file_path="speaker.mp4"))
+    speech_timelines = {
+        lecturer_key: [],
+        speaker_key: [(0.0, 0.3)],
+    }
+
+    timeline = compute_layout_timeline(
+        streams=streams,
+        total_duration=10.0,
+        admin_user_id=1,
+        hide_silent=True,
+        speech_timelines=speech_timelines,
+        start_time=0.0,
+    )
+
+    assert len(timeline) == 1
+    assert [c[0] for c in timeline[0]["cameras"]] == [lecturer_key, speaker_key]
+
+
+def test_parse_presentation_timeline_uses_slide_index_changes():
+    json_data = {
+        "duration": 30.0,
+        "eventLogs": [
+            {
+                "module": "presentation.update",
+                "relativeTime": 0.0,
+                "data": {
+                    "isActive": True,
+                    "slideIndex": 0,
+                    "fileReference": {
+                        "file": {
+                            "slides": [
+                                {"url": "s1.jpg"},
+                                {"url": "s2.jpg"},
+                            ]
+                        }
+                    },
+                },
+            },
+            {
+                "module": "presentation.update",
+                "relativeTime": 5.0,
+                "data": {"isActive": True, "slideIndex": 0},
+            },
+            {
+                "module": "presentation.update",
+                "relativeTime": 10.0,
+                "data": {"isActive": True, "slideIndex": 1},
+            },
+            {
+                "module": "presentation.update",
+                "relativeTime": 20.0,
+                "data": {"isActive": False},
+            },
+        ],
+    }
+
+    slides, timeline = parse_presentation_timeline(json_data)
+
+    assert slides == ["s1.jpg", "s2.jpg"]
+    assert timeline == [(0.0, 10.0, "s1.jpg"), (10.0, 20.0, "s2.jpg")]
