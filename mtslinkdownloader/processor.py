@@ -155,6 +155,29 @@ def _has_speech_at(timeline: list, t: float) -> bool:
     return False
 
 
+def _choose_primary_screenshare(active: list, streams: dict, admin_user_id: Optional[int]) -> Optional[tuple]:
+    screenshares = [a for a in active if streams[a[0]]['is_screenshare']]
+    if not screenshares:
+        return None
+
+    def _score(item: tuple) -> tuple:
+        sk, clip, _ = item
+        stream = streams[sk]
+        width = int(clip.get('width') or 0)
+        height = int(clip.get('height') or 0)
+        area = width * height
+        clip_start = float(clip.get('relative_time') or 0.0)
+        return (
+            1 if _is_lecturer_stream(stream, admin_user_id) else 0,
+            1 if clip.get('has_video') else 0,
+            area,
+            clip_start,
+            1 if clip.get('has_audio') else 0,
+        )
+
+    return max(screenshares, key=_score)
+
+
 def _speech_overlap_duration(timeline: list, start: float, end: float) -> float:
     total = 0.0
     for s, e in timeline:
@@ -359,6 +382,9 @@ def _extract_slide_url(data: dict, slides: List[str], current_url: Optional[str]
                 return source[idx]
             if 1 <= idx <= len(source):
                 return source[idx - 1]
+
+    if deck_slides and len(deck_slides) == 1 and deck_slides[0]:
+        return deck_slides[0]
 
     if current_url:
         return current_url
@@ -648,7 +674,7 @@ def compute_layout_timeline(streams: dict, total_duration: float, admin_user_id:
             if not clip:
                 clip, seek = _find_clip_at_time(s, t_m)
             if clip: active.append((sk, clip, seek))
-        screenshare = next((a for a in active if streams[a[0]]['is_screenshare']), None)
+        screenshare = _choose_primary_screenshare(active, streams, admin_user_id)
         all_cameras = [a for a in active if not streams[a[0]]['is_screenshare']]
         audio_sources = [a for a in active if a[1]['has_audio']]
         lecturer = next((c for c in all_cameras if _is_lecturer_stream(streams[c[0]], admin_user_id)), None)

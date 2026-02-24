@@ -88,6 +88,33 @@ def test_compute_layout_splits_timeline_on_chat_events():
     assert [s["chat_version"] for s in timeline] == [0, 1, 2]
 
 
+def test_compute_layout_prefers_lecturer_screenshare_when_multiple_active():
+    lecturer_screen_key = ("lecturer_screen", True)
+    participant_screen_key = ("participant_screen", True)
+    streams = {
+        lecturer_screen_key: _make_stream(is_admin=True, is_screenshare=True, user_id=1, user_name="Lecturer"),
+        participant_screen_key: _make_stream(is_admin=False, is_screenshare=True, user_id=2, user_name="Participant"),
+    }
+    streams[lecturer_screen_key]["clips"].append(
+        _make_clip(start=0.0, duration=10.0, has_video=True, has_audio=False, file_path="lecturer_screen.mp4")
+    )
+    streams[participant_screen_key]["clips"].append(
+        _make_clip(start=0.0, duration=10.0, has_video=True, has_audio=False, file_path="participant_screen.mp4")
+    )
+
+    timeline = compute_layout_timeline(
+        streams=streams,
+        total_duration=10.0,
+        admin_user_id=1,
+        start_time=0.0,
+    )
+
+    assert len(timeline) == 1
+    screenshare = timeline[0]["screenshare"]
+    assert screenshare is not None
+    assert screenshare[0] == lecturer_screen_key
+
+
 def test_build_chat_overlay_text_uses_latest_messages_only():
     events = [
         {"time": 1.0, "type": "CHAT", "user": "u1", "text": "m1"},
@@ -431,6 +458,54 @@ def test_parse_presentation_timeline_switches_deck_on_direct_url_before_slides_l
         (10.0, 20.0, "b1.jpg"),
     ]
     assert slides == ["a1.jpg", "b1.jpg", "a2.jpg", "b2.jpg"]
+
+
+def test_parse_presentation_timeline_uses_single_slide_payload_as_current_slide():
+    json_data = {
+        "duration": 20.0,
+        "eventLogs": [
+            {
+                "module": "presentation.update",
+                "relativeTime": 0.0,
+                "data": {
+                    "isActive": True,
+                    "fileReference": {"file": {"slides": [{"url": "s1.jpg"}]}}
+                },
+            },
+            {
+                "module": "presentation.update",
+                "relativeTime": 5.0,
+                "data": {
+                    "isActive": True,
+                    "fileReference": {"file": {"slides": [{"url": "s2.jpg"}]}}
+                },
+            },
+            {
+                "module": "presentation.update",
+                "relativeTime": 10.0,
+                "data": {
+                    "isActive": True,
+                    "fileReference": {"file": {"slides": [{"url": "s3.jpg"}]}}
+                },
+            },
+            {
+                "module": "presentation.update",
+                "relativeTime": 15.0,
+                "data": {
+                    "isActive": False,
+                },
+            },
+        ],
+    }
+
+    slides, timeline = parse_presentation_timeline(json_data)
+
+    assert timeline == [
+        (0.0, 5.0, "s1.jpg"),
+        (5.0, 10.0, "s2.jpg"),
+        (10.0, 15.0, "s3.jpg"),
+    ]
+    assert slides == ["s1.jpg", "s2.jpg", "s3.jpg"]
 
 
 def test_source_switch_diagnostics_warns_when_presentation_and_screenshare_overlap(caplog):
