@@ -63,7 +63,7 @@ def extract_ids_from_url(url: str) -> Tuple[Optional[str], Optional[str]]:
 
 
 def main():
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, force=True)
     # Silence httpx logs to keep progress bars readable
     logging.getLogger("httpx").setLevel(logging.WARNING)
 

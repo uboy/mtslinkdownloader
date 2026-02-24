@@ -4,6 +4,8 @@ import logging
 import sys
 import os
 import re
+import time
+from datetime import datetime
 from typing import Optional
 
 # Pre-import to avoid issues
@@ -122,7 +124,7 @@ class App(ctk.CTk):
         sys.stdout = self.redirector
         sys.stderr = self.redirector
 
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s]: %(message)s', datefmt='%H:%M:%S', stream=sys.stderr)
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s]: %(message)s', datefmt='%H:%M:%S', stream=sys.stderr, force=True)
         logging.getLogger("httpx").setLevel(logging.WARNING)
 
         print(f"App initialized. Base path: {get_base_path()}")
@@ -153,6 +155,8 @@ class App(ctk.CTk):
         thread.start()
 
     def run_process(self, url, s_id, t_start, t_max, h_silent, quality):
+        run_started_ts = time.perf_counter()
+        run_started_at = datetime.now()
         try:
             event_sessions, record_id = extract_ids_from_url(url)
             if not event_sessions:
@@ -170,6 +174,7 @@ class App(ctk.CTk):
             
             print(f"Working on: {json_data['name']}")
             print("-" * 40)
+            print(f"  Started at:   {run_started_at.strftime('%Y-%m-%d %H:%M:%S')}")
             print(f"  Start offset: {t_start} seconds")
             print(f"  Max duration: {t_max if t_max else 'Full record'} seconds")
             print(f"  Quality:      {quality.upper()}")
@@ -180,13 +185,29 @@ class App(ctk.CTk):
             process_composite_video(directory, json_data, output_video_path, t_max, hide_silent=h_silent, start_time=t_start, quality=quality)
             
             full_path = os.path.abspath(output_video_path)
+            run_finished_at = datetime.now()
+            elapsed = int(time.perf_counter() - run_started_ts)
+            h, rem = divmod(elapsed, 3600)
+            m, s = divmod(rem, 60)
             print(f"\n!!! SUCCESS !!! Video is ready.")
             print(f"Path: {full_path}")
+            print(f"Finished at: {run_finished_at.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"Total elapsed: {h:02d}:{m:02d}:{s:02d}")
         except Exception as e:
             if "interrupted" in str(e).lower():
+                run_finished_at = datetime.now()
+                elapsed = int(time.perf_counter() - run_started_ts)
+                h, rem = divmod(elapsed, 3600)
+                m, s = divmod(rem, 60)
                 print("\n[!] Process stopped by user.")
+                print(f"Stopped at: {run_finished_at.strftime('%Y-%m-%d %H:%M:%S')} | Elapsed: {h:02d}:{m:02d}:{s:02d}")
             else:
+                run_finished_at = datetime.now()
+                elapsed = int(time.perf_counter() - run_started_ts)
+                h, rem = divmod(elapsed, 3600)
+                m, s = divmod(rem, 60)
                 print(f"\nFATAL ERROR: {e}")
+                print(f"Failed at: {run_finished_at.strftime('%Y-%m-%d %H:%M:%S')} | Elapsed: {h:02d}:{m:02d}:{s:02d}")
         finally:
             self.download_btn.after(0, self._reset_buttons)
 

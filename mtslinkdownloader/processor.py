@@ -6,6 +6,8 @@ import re
 import sys
 import subprocess
 import tempfile
+import datetime
+import time
 from bisect import bisect_right
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -55,7 +57,8 @@ def _detect_best_encoder() -> Tuple[str, str, int]:
             return 'h264_qsv', 'veryfast', 3
     except Exception: pass
     cpu_count = os.cpu_count() or 4
-    workers = 32 if cpu_count >= 60 else max(1, cpu_count // 2)
+    # Conservative parallelism for software x264: too many workers often slows down total render time.
+    workers = max(1, min(8, cpu_count // 4))
     return 'libx264', 'ultrafast', workers
 
 def _probe_media(file_path: str) -> dict:
@@ -181,17 +184,87 @@ def _escape_drawtext_path(path: str) -> str:
     normalized = normalized.replace("'", r"\'")
     return normalized
 
+
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _extract_text_value(data: dict) -> Optional[str]:
+    if not isinstance(data, dict):
+        return None
+    candidates = [
+        data.get('text'),
+        data.get('message'),
+        data.get('content'),
+        data.get('body'),
+        data.get('htmlText'),
+        data.get('plainText'),
+    ]
+    nested = [
+        data.get('payload'),
+        data.get('message'),
+        data.get('chat'),
+        data.get('question'),
+        data.get('comment'),
+        data.get('value'),
+    ]
+    for n in nested:
+        if isinstance(n, dict):
+            candidates.extend([
+                n.get('text'),
+                n.get('message'),
+                n.get('content'),
+                n.get('body'),
+                n.get('htmlText'),
+                n.get('plainText'),
+            ])
+    for c in candidates:
+        if isinstance(c, str):
+            text = c.strip()
+            if text:
+                return text
+    return None
+
+
+def _extract_user_name(data: dict, default_name: str) -> str:
+    if not isinstance(data, dict):
+        return default_name
+    candidates = [
+        data.get('nickname'),
+        data.get('userName'),
+        data.get('authorName'),
+    ]
+    for key in ('user', 'sender', 'author', 'from'):
+        v = data.get(key)
+        if isinstance(v, dict):
+            candidates.extend([v.get('nickname'), v.get('name'), v.get('displayName')])
+    for c in candidates:
+        if isinstance(c, str) and c.strip():
+            return c.strip()
+    return default_name
+
 # ─── Parsing ─────────────────────────────────────────────────────────────
 
 def parse_chat_and_questions(json_data: dict) -> Tuple[list, list]:
     event_logs = json_data.get('eventLogs', [])
     chat, questions = [], []
     for event in event_logs:
-        module, t, data = event.get('module', ''), event.get('relativeTime', 0), event.get('data', {})
-        if module == 'chat.add' and 'text' in data:
-            chat.append({'time': t, 'user': data.get('user', {}).get('nickname', 'System'), 'text': data['text'], 'type': 'CHAT'})
-        elif module == 'question.add' and 'text' in data:
-            questions.append({'time': t, 'user': data.get('user', {}).get('nickname', 'Anonymous'), 'text': data['text'], 'type': 'Q&A'})
+        module, t, data = str(event.get('module', '')).lower(), event.get('relativeTime', 0), event.get('data', {})
+        if not isinstance(data, dict):
+            continue
+        text = _extract_text_value(data)
+        if not text:
+            continue
+        event_type = str(data.get('type', '')).lower()
+        is_question = 'question' in module or event_type in {'question', 'q&a', 'qa'}
+        is_chat = ('chat' in module) or ('message' in module) or ('comment' in module) or event_type == 'chat'
+        if is_question:
+            questions.append({'time': t, 'user': _extract_user_name(data, 'Anonymous'), 'text': text, 'type': 'Q&A'})
+        elif is_chat:
+            chat.append({'time': t, 'user': _extract_user_name(data, 'System'), 'text': text, 'type': 'CHAT'})
     return chat, questions
 
 def format_time_srt(seconds: float) -> str:
@@ -346,11 +419,13 @@ def compute_layout_timeline(streams: dict, total_duration: float, admin_user_id:
     for s in streams.values():
         for c in s['clips']:
             if c['duration'] > 0:
-                if c['relative_time'] >= start_time: change_points.add(c['relative_time'])
-                if c['relative_time'] + c['duration'] <= total_duration: change_points.add(c['relative_time'] + c['duration'])
+                c_start = c['relative_time']
+                c_end = c['relative_time'] + c['duration']
+                if start_time <= c_start <= total_duration: change_points.add(c_start)
+                if start_time <= c_end <= total_duration: change_points.add(c_end)
     for s_s, s_e, _ in (slide_timeline or []):
-        if s_s >= start_time: change_points.add(s_s)
-        if s_e <= total_duration: change_points.add(s_e)
+        if start_time <= s_s <= total_duration: change_points.add(s_s)
+        if start_time <= s_e <= total_duration: change_points.add(s_e)
     for t in event_times:
         change_points.add(t)
     sorted_p = sorted(list(change_points))
@@ -517,10 +592,13 @@ def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str,
     _run_ffmpeg(cmd, desc=f'seg {seg_index}', timeout=max(120, int(60+duration*30)))
     return output_path
 
-def render_all_segments(timeline: list, streams: dict, tmpdir: str, out_w: int = 1920, out_h: int = 1080, events: list = None) -> list:
+def render_all_segments(timeline: list, streams: dict, tmpdir: str, out_w: int = 1920, out_h: int = 1080, events: list = None, process_started_ts: Optional[float] = None) -> list:
     global STOP_REQUESTED
     encoder, preset, max_workers = _detect_best_encoder(); cpu_count = os.cpu_count() or 4
-    threads_per_worker = max(2, cpu_count // max_workers); segment_files = [None] * len(timeline)
+    threads_per_worker = max(1, min(4, cpu_count // max_workers)); segment_files = [None] * len(timeline)
+    render_started_ts = time.perf_counter()
+    render_started_at = datetime.datetime.now()
+    logging.info(f'Rendering started at {render_started_at.strftime("%Y-%m-%d %H:%M:%S")} ({len(timeline)} segments) | encoder={encoder}, preset={preset}, workers={max_workers}, threads/worker={threads_per_worker}')
     tqdm_handler = TqdmLoggingHandler(); root_logger = logging.getLogger()
     tqdm_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s]: %(message)s', datefmt='%H:%M:%S'))
     root_logger.addHandler(tqdm_handler)
@@ -528,6 +606,7 @@ def render_all_segments(timeline: list, streams: dict, tmpdir: str, out_w: int =
         tqdm_args = {"total": len(timeline), "desc": "Rendering", "unit": "seg", "ascii": True, "mininterval": 0.5, "leave": True}
         with tqdm.tqdm(**tqdm_args) as pbar:
             executor = ThreadPoolExecutor(max_workers=max_workers)
+            completed = 0
             try:
                 futures = {executor.submit(_render_segment, i, s, streams, tmpdir, threads_per_worker, encoder, preset, out_w, out_h, events): i for i, s in enumerate(timeline)}
                 for f in as_completed(futures):
@@ -541,9 +620,19 @@ def render_all_segments(timeline: list, streams: dict, tmpdir: str, out_w: int =
                         if 'interrupted' not in str(e): logging.error(f'Critical: Segment {idx} failed: {e}')
                         executor.shutdown(wait=False, cancel_futures=True); raise
                     pbar.update(1)
+                    completed += 1
+                    if completed % 10 == 0 or completed == len(timeline):
+                        render_elapsed = _format_elapsed(time.perf_counter() - render_started_ts)
+                        if process_started_ts is not None:
+                            total_elapsed = _format_elapsed(time.perf_counter() - process_started_ts)
+                            logging.info(f'Rendering progress: {completed}/{len(timeline)} segments | render elapsed {render_elapsed} | total elapsed {total_elapsed}')
+                        else:
+                            logging.info(f'Rendering progress: {completed}/{len(timeline)} segments | render elapsed {render_elapsed}')
             finally: executor.shutdown(wait=True)
     finally: root_logger.removeHandler(tqdm_handler)
     if STOP_REQUESTED: raise RuntimeError("interrupted")
+    render_finished_at = datetime.datetime.now()
+    logging.info(f'Rendering finished at {render_finished_at.strftime("%Y-%m-%d %H:%M:%S")} | render elapsed {_format_elapsed(time.perf_counter() - render_started_ts)}')
     return [f for f in segment_files if f]
 
 def concat_segments(segment_files: list, output_path: str):
@@ -556,10 +645,16 @@ def concat_segments(segment_files: list, output_path: str):
 def process_composite_video(directory: str, json_data: dict, output_path: str, max_duration=None, hide_silent: bool = False, start_time: float = 0, quality: str = "1080p"):
     global STOP_REQUESTED
     STOP_REQUESTED = False 
+    process_started_ts = time.perf_counter()
+    process_started_at = datetime.datetime.now()
+    logging.info(f'Process started at {process_started_at.strftime("%Y-%m-%d %H:%M:%S")}')
     res_map = {"1080p": (1920, 1080), "720p": (1280, 720)}
     out_w, out_h = res_map.get(quality, (1920, 1080))
     total_duration = float(json_data.get('duration', 0))
     if max_duration: total_duration = min(total_duration, start_time + max_duration)
+    if total_duration <= start_time:
+        raise ValueError(f'Invalid time window: start_time={start_time}, end_time={total_duration}')
+    logging.info(f'Target timeline: start={start_time:.1f}s, end={total_duration:.1f}s, duration={max(0.0, total_duration-start_time):.1f}s')
     chat, questions = parse_chat_and_questions(json_data)
     all_events = sorted(chat + questions, key=lambda x: x['time'])
     export_chat_files(chat, questions, directory, os.path.basename(output_path).replace('.mp4', ''))
@@ -570,6 +665,7 @@ def process_composite_video(directory: str, json_data: dict, output_path: str, m
             if s['is_screenshare']: c['_is_screenshare'] = True
             elif hide_silent: c['_run_vad'] = True
     download_and_probe_all(streams, directory)
+    logging.info(f'Files processed | elapsed {_format_elapsed(time.perf_counter() - process_started_ts)}')
     _reclassify_screenshare_by_dimensions(streams)
     slides, s_timeline = parse_presentation_timeline(json_data)
     if slides:
@@ -588,13 +684,16 @@ def process_composite_video(directory: str, json_data: dict, output_path: str, m
     speech_timelines = {sk: _build_stream_speech_timeline(s) for sk, s in streams.items() if not s['is_screenshare']} if hide_silent else {}
     timeline = compute_layout_timeline(streams, total_duration, admin_id, hide_silent, speech_timelines, start_time, s_timeline, all_events)
     if not timeline: return
+    logging.info(f'Timeline ready: {len(timeline)} segments | elapsed {_format_elapsed(time.perf_counter() - process_started_ts)}')
     if hide_silent:
         active = {streams[sk]['user_name'] for sk, t in speech_timelines.items() if t}
         logging.info(f'Active participants (with speech): {len(active)}')
     with tempfile.TemporaryDirectory() as tmp:
-        files = render_all_segments(timeline, streams, tmp, out_w, out_h, events=all_events)
+        files = render_all_segments(timeline, streams, tmp, out_w, out_h, events=all_events, process_started_ts=process_started_ts)
         if files: concat_segments(files, output_path)
     logging.info(f'Done: {output_path}')
+    process_finished_at = datetime.datetime.now()
+    logging.info(f'Process finished at {process_finished_at.strftime("%Y-%m-%d %H:%M:%S")} | total elapsed {_format_elapsed(time.perf_counter() - process_started_ts)}')
 
 def process_video_clips(directory: str, json_data: Dict, max_workers: int = 16) -> Tuple[float, List[dict], List[dict]]:
     total_duration = float(json_data.get('duration', 0))
