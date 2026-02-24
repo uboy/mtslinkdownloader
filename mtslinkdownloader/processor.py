@@ -12,6 +12,7 @@ import textwrap
 from bisect import bisect_right
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple, Union
 
 import shutil
@@ -487,6 +488,29 @@ class TqdmLoggingHandler(logging.Handler):
             self.flush()
         except Exception: self.handleError(record)
 
+
+@contextmanager
+def _tqdm_console_logging(root_logger: logging.Logger, formatter: logging.Formatter):
+    tqdm_handler = TqdmLoggingHandler()
+    tqdm_handler.setFormatter(formatter)
+
+    console_handlers = [
+        h for h in list(root_logger.handlers)
+        if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+    ]
+
+    for handler in console_handlers:
+        root_logger.removeHandler(handler)
+    root_logger.addHandler(tqdm_handler)
+
+    try:
+        yield
+    finally:
+        root_logger.removeHandler(tqdm_handler)
+        for handler in console_handlers:
+            if handler not in root_logger.handlers:
+                root_logger.addHandler(handler)
+
 def _download_and_probe_clip(clip: dict, directory: str, client) -> Optional[str]:
     if STOP_REQUESTED: return "Interrupted"
     try:
@@ -565,16 +589,18 @@ def compute_layout_timeline(streams: dict, total_duration: float, admin_user_id:
         audio_sources = [a for a in active if a[1]['has_audio']]
         lecturer = next((c for c in all_cameras if _is_lecturer_stream(streams[c[0]], admin_user_id)), None)
         cameras = list(all_cameras)
+        preserve_speaking_order = bool(hide_silent and speech_timelines)
         if hide_silent and speech_timelines:
             speaking_overlap = {c[0]: _speech_overlap_duration(speech_timelines.get(c[0], []), t_s, t_e) for c in all_cameras}
             speaking = [c for c in all_cameras if speaking_overlap.get(c[0], 0.0) > 0.05]
-            speaking.sort(key=lambda c: speaking_overlap.get(c[0], 0.0), reverse=True)
+            speaking.sort(key=lambda c: (-speaking_overlap.get(c[0], 0.0), streams[c[0]].get('user_name', '').lower()))
             cameras = ([lecturer] if lecturer else []) + [c for c in speaking if not lecturer or c[0] != lecturer[0]]
         cameras = [c for c in cameras if c[1]['has_video'] or c[1]['has_audio']]
         if lecturer and not any(c[0] == lecturer[0] for c in cameras):
             if lecturer[1]['has_video'] or lecturer[1]['has_audio']:
                 cameras = [lecturer] + cameras
-        cameras.sort(key=lambda c: (0 if _is_lecturer_stream(streams[c[0]], admin_user_id) else 1, streams[c[0]].get('user_name', '').lower()))
+        if not preserve_speaking_order:
+            cameras.sort(key=lambda c: (0 if _is_lecturer_stream(streams[c[0]], admin_user_id) else 1, streams[c[0]].get('user_name', '').lower()))
         slide = next((path for s_s, s_e, path in (slide_timeline or []) if s_s <= t_probe < s_e), None) if not screenshare else None
         chat_version = bisect_right(event_times, t_probe)
         segments.append({'start': t_s, 'end': t_e, 'screenshare': screenshare, 'cameras': cameras, 'audio_sources': audio_sources, 'slide_image': slide, 'chat_version': chat_version})
@@ -743,10 +769,9 @@ def render_all_segments(timeline: list, streams: dict, tmpdir: str, out_w: int =
     render_started_ts = time.perf_counter()
     render_started_at = datetime.datetime.now()
     logging.info(f'Rendering started at {render_started_at.strftime("%Y-%m-%d %H:%M:%S")} ({len(timeline)} segments) | encoder={encoder}, preset={preset}, workers={max_workers}, threads/worker={threads_per_worker}')
-    tqdm_handler = TqdmLoggingHandler(); root_logger = logging.getLogger()
-    tqdm_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s]: %(message)s', datefmt='%H:%M:%S'))
-    root_logger.addHandler(tqdm_handler)
-    try:
+    root_logger = logging.getLogger()
+    formatter = logging.Formatter('%(asctime)s [%(levelname)s]: %(message)s', datefmt='%H:%M:%S')
+    with _tqdm_console_logging(root_logger, formatter):
         tqdm_args = {"total": len(timeline), "desc": "Rendering", "unit": "seg", "ascii": True, "mininterval": 0.5, "leave": True}
         with tqdm.tqdm(**tqdm_args) as pbar:
             executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -773,7 +798,6 @@ def render_all_segments(timeline: list, streams: dict, tmpdir: str, out_w: int =
                         else:
                             logging.info(f'Rendering progress: {completed}/{len(timeline)} segments | render elapsed {render_elapsed}')
             finally: executor.shutdown(wait=True)
-    finally: root_logger.removeHandler(tqdm_handler)
     if STOP_REQUESTED: raise RuntimeError("interrupted")
     render_finished_at = datetime.datetime.now()
     logging.info(f'Rendering finished at {render_finished_at.strftime("%Y-%m-%d %H:%M:%S")} | render elapsed {_format_elapsed(time.perf_counter() - render_started_ts)}')

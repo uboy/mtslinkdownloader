@@ -2,6 +2,7 @@ from mtslinkdownloader.processor import (
     compute_layout_timeline,
     _build_chat_overlay_text,
     _format_elapsed,
+    _resolve_total_duration,
     parse_chat_and_questions,
     parse_presentation_timeline,
 )
@@ -187,6 +188,74 @@ def test_compute_layout_uses_speech_overlap_not_midpoint_only():
 
     assert len(timeline) == 1
     assert [c[0] for c in timeline[0]["cameras"]] == [lecturer_key, speaker_key]
+
+
+def test_compute_layout_places_first_speaking_participant_next_to_lecturer():
+    lecturer_key = ("lecturer", False)
+    alpha_key = ("alpha", False)
+    zeta_key = ("zeta", False)
+    streams = {
+        lecturer_key: _make_stream(is_admin=True, user_id=1, user_name="Lecturer"),
+        alpha_key: _make_stream(is_admin=False, user_id=2, user_name="Alpha"),
+        zeta_key: _make_stream(is_admin=False, user_id=3, user_name="Zeta"),
+    }
+    for key, path in ((lecturer_key, "lecturer.mp4"), (alpha_key, "alpha.mp4"), (zeta_key, "zeta.mp4")):
+        streams[key]["clips"].append(_make_clip(start=0.0, duration=10.0, file_path=path))
+    speech_timelines = {
+        lecturer_key: [],
+        alpha_key: [(0.0, 2.0)],
+        zeta_key: [(0.0, 8.0)],
+    }
+
+    timeline = compute_layout_timeline(
+        streams=streams,
+        total_duration=10.0,
+        admin_user_id=1,
+        hide_silent=True,
+        speech_timelines=speech_timelines,
+        start_time=0.0,
+    )
+
+    assert len(timeline) == 1
+    assert [c[0] for c in timeline[0]["cameras"]] == [lecturer_key, zeta_key, alpha_key]
+
+
+def test_compute_layout_hide_silent_keeps_audio_for_hidden_participants():
+    lecturer_key = ("lecturer", False)
+    participant_key = ("participant", False)
+    streams = {
+        lecturer_key: _make_stream(is_admin=True, user_id=1, user_name="Lecturer"),
+        participant_key: _make_stream(is_admin=False, user_id=2, user_name="Participant"),
+    }
+    streams[lecturer_key]["clips"].append(_make_clip(start=0.0, duration=10.0, file_path="lecturer.mp4"))
+    streams[participant_key]["clips"].append(_make_clip(start=0.0, duration=10.0, file_path="participant.mp4"))
+    speech_timelines = {
+        lecturer_key: [],
+        participant_key: [],
+    }
+
+    timeline = compute_layout_timeline(
+        streams=streams,
+        total_duration=10.0,
+        admin_user_id=1,
+        hide_silent=True,
+        speech_timelines=speech_timelines,
+        start_time=0.0,
+    )
+
+    assert len(timeline) == 1
+    assert [c[0] for c in timeline[0]["cameras"]] == [lecturer_key]
+    assert {a[0] for a in timeline[0]["audio_sources"]} == {lecturer_key, participant_key}
+
+
+def test_resolve_total_duration_applies_max_duration_window():
+    duration = _resolve_total_duration(
+        json_data={"duration": 120.0},
+        max_duration=15.0,
+        start_time=40.0,
+    )
+
+    assert duration == 55.0
 
 
 def test_parse_presentation_timeline_uses_slide_index_changes():
