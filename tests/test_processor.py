@@ -88,7 +88,7 @@ def test_build_chat_overlay_text_uses_latest_messages_only():
 
     text = _build_chat_overlay_text(events, t=3.0, max_lines=2)
 
-    assert "[Q&A 00:00:03]" in text
+    assert "[Q&A 00:00:03] u3" in text
     assert "m3" in text
     assert "[CHAT 00:00:02]" not in text
     assert "m1" not in text
@@ -100,7 +100,7 @@ def test_build_chat_overlay_text_wraps_long_lines():
     ]
     text = _build_chat_overlay_text(events, t=12.0, max_lines=6, wrap_chars=12)
 
-    assert "[CHAT 00:00:12]" in text
+    assert "[CHAT 00:00:12] u1" in text
     assert "this is a very" in text
     assert "long chat" in text
 
