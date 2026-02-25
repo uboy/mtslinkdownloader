@@ -688,3 +688,60 @@ def test_run_ffmpeg_treats_signal_2_as_interrupted(monkeypatch):
 
     with pytest.raises(RuntimeError, match="interrupted"):
         processor._run_ffmpeg(["-version"], desc="probe")
+
+
+def test_parse_presentation_timeline_handles_nested_slide_lists():
+    json_data = {
+        "duration": 100.0,
+        "eventLogs": [
+            {
+                "module": "presentation.update",
+                "relativeTime": 10.0,
+                "data": {
+                    "isActive": True,
+                    "fileReference": {
+                        "file": {
+                            "slides": [
+                                [{"url": "s1.jpg"}, {"url": "s2.jpg"}],
+                                {"url": "s3.jpg"}
+                            ]
+                        }
+                    },
+                    "slide": {"url": "s1.jpg"}
+                }
+            }
+        ]
+    }
+    
+    slides, timeline = processor.parse_presentation_timeline(json_data)
+    assert slides == ["s1.jpg", "s2.jpg", "s3.jpg"]
+    assert timeline == [(10.0, 100.0, "s1.jpg")]
+
+
+def test_extract_slide_url_filters_non_image_extensions():
+    data = {
+        "url": "http://example.com/deck.pptx",
+        "slide": {
+            "url": "http://example.com/slide1.jpg"
+        }
+    }
+    
+    # Nested slide.url should be preferred over root .pptx url
+    res = processor._extract_slide_url(data, [], None)
+    assert res == "http://example.com/slide1.jpg"
+    
+    # If root is only option but it's pptx, it should be ignored
+    data_only_pptx = {"url": "http://example.com/deck.pptx"}
+    res = processor._extract_slide_url(data_only_pptx, [], None)
+    assert res is None
+
+
+def test_extract_slide_url_prefers_nested_nodes():
+    data = {
+        "url": "http://example.com/fallback.jpg",
+        "slide": {
+            "url": "http://example.com/actual.jpg"
+        }
+    }
+    res = processor._extract_slide_url(data, [], None)
+    assert res == "http://example.com/actual.jpg"

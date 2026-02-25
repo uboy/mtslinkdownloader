@@ -356,20 +356,29 @@ def _extract_slide_url(data: dict, slides: List[str], current_url: Optional[str]
         return current_url
 
     direct_urls = []
-    for key in ('url', 'slideUrl', 'currentSlideUrl', 'imageUrl'):
-        v = data.get(key)
-        if isinstance(v, str) and v.strip():
-            direct_urls.append(v.strip())
+    # Check nested nodes first as they are more specific to the current slide
     for node_key in ('slide', 'currentSlide', 'presentation', 'page'):
         node = data.get(node_key)
         if isinstance(node, dict):
             for key in ('url', 'slideUrl', 'imageUrl'):
                 v = node.get(key)
                 if isinstance(v, str) and v.strip():
+                    if any(v.lower().endswith(ext) for ext in ('.pptx', '.pdf', '.ppt', '.doc', '.docx', '.xls', '.xlsx')):
+                        continue
                     direct_urls.append(v.strip())
+    
+    # Root level URLs as fallback
+    for key in ('url', 'slideUrl', 'currentSlideUrl', 'imageUrl'):
+        v = data.get(key)
+        if isinstance(v, str) and v.strip():
+            if any(v.lower().endswith(ext) for ext in ('.pptx', '.pdf', '.ppt', '.doc', '.docx', '.xls', '.xlsx')):
+                continue
+            direct_urls.append(v.strip())
+    
     ref_url = data.get('fileReference', {}).get('file', {}).get('currentSlide', {}).get('url')
     if isinstance(ref_url, str) and ref_url.strip():
-        direct_urls.append(ref_url.strip())
+        if not any(ref_url.lower().endswith(ext) for ext in ('.pptx', '.pdf', '.ppt', '.doc', '.docx', '.xls', '.xlsx')):
+            direct_urls.append(ref_url.strip())
     for u in direct_urls:
         return u
 
@@ -394,7 +403,11 @@ def _extract_slide_url(data: dict, slides: List[str], current_url: Optional[str]
 
     for idx in idx_candidates:
         for source in lookup_sources:
+            # Try 0-based first, then 1-based.
+            # Most MTS Link events use 0-based slideIndex, but some might use 1-based 'page' or 'number'.
             if 0 <= idx < len(source):
+                # If we have exactly one slide, or if idx is small enough, it's ambiguous.
+                # But usually 0-based is preferred for 'slideIndex'.
                 return source[idx]
             if 1 <= idx <= len(source):
                 return source[idx - 1]
@@ -593,7 +606,16 @@ def parse_presentation_timeline(json_data: dict) -> Tuple[List[str], List[Tuple[
         slide_list = data.get('fileReference', {}).get('file', {}).get('slides', [])
         if not isinstance(slide_list, list):
             return []
-        return [s.get('url', '') for s in slide_list if isinstance(s, dict) and s.get('url')]
+        
+        res = []
+        for item in slide_list:
+            if isinstance(item, list):
+                for sub_item in item:
+                    if isinstance(sub_item, dict) and sub_item.get('url'):
+                        res.append(sub_item.get('url'))
+            elif isinstance(item, dict) and item.get('url'):
+                res.append(item.get('url'))
+        return res
 
     start, current_url = None, None
     for event in pres_events:
