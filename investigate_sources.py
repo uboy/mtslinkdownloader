@@ -145,6 +145,6 @@ def main(url: str, target_time: float = 2376.5, session_id: Optional[str] = None
 
 if __name__ == "__main__":
     webinar_url = "https://hse.mts-link.ru/j/21462290/13201551527/record-new/12430577767"
-    # Testing 01:25:40 (5140s) and around it
-    for t in [5140.0]:
+    # Testing 00:40:00 (2400s) which is during screenshare
+    for t in [2400.0]:
         main(webinar_url, t)

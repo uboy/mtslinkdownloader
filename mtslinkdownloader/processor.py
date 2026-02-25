@@ -937,8 +937,10 @@ def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str,
         curr_v, ov_idx = f'v{ov_idx}', ov_idx + 1
 
     chat_wrap_chars = max(20, int((chat_w - 22) / 7.3))
-    chat_max_lines = max(6, int((chat_h - 44) / 20))
-    chat_txt = _build_chat_overlay_text(events, t_start, max_lines=chat_max_lines, wrap_chars=chat_wrap_chars)
+    chat_max_lines = max(10, int((chat_h - 44) / 18))
+    # Use probe time (middle of segment) for chat to match timeline split logic
+    t_probe = t_start + duration / 2
+    chat_txt = _build_chat_overlay_text(events, t_probe, max_lines=chat_max_lines, wrap_chars=chat_wrap_chars)
     chat_path = os.path.join(tmpdir, f'chat_{seg_index:05d}.txt')
     with open(chat_path, 'w', encoding='utf-8') as f:
         f.write(chat_txt)

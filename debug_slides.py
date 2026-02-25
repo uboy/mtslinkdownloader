@@ -30,34 +30,31 @@ def format_time_readable(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 def download_slides_with_timestamps(directory: str, slide_timeline: List[Tuple[float, float, str]]) -> List[Tuple[float, float, str]]:
-    """Downloads slides and gives them names with timestamps."""
+    """Downloads slides and gives them names with start and end timestamps."""
     materialized = []
-    url_to_path = {}
     
     if not os.path.exists(directory):
         os.makedirs(directory)
 
     with create_shared_client() as client:
-        for start, end, url in slide_timeline:
-            if url not in url_to_path:
-                ts_str = format_time_filename(start)
-                filename = f"slide_{ts_str}.jpg"
-                path = os.path.join(directory, filename)
-                
-                if not os.path.exists(path):
-                    try:
-                        response = client.get(url)
-                        response.raise_for_status()
-                        with open(path, 'wb') as f:
-                            f.write(response.content)
-                        # print(f"Downloaded: {filename}")
-                    except Exception as e:
-                        print(f"Failed to download {url}: {e}")
-                        path = f"MISSING_{url}"
-                
-                url_to_path[url] = path
+        for i, (start, end, url) in enumerate(slide_timeline):
+            ts_start = format_time_filename(start)
+            ts_end = format_time_filename(end)
+            # Use index i to keep sequence if multiple intervals use same URL
+            filename = f"{i:03d}_slide_{ts_start}_to_{ts_end}.jpg"
+            path = os.path.join(directory, filename)
             
-            materialized.append((start, end, url_to_path[url]))
+            if not os.path.exists(path):
+                try:
+                    response = client.get(url)
+                    response.raise_for_status()
+                    with open(path, 'wb') as f:
+                        f.write(response.content)
+                except Exception as e:
+                    print(f"Failed to download {url}: {e}")
+                    path = f"MISSING_{url}"
+            
+            materialized.append((start, end, path))
             
     return materialized
 
@@ -75,7 +72,8 @@ def main(url: str, session_id: Optional[str] = None):
         print("Failed to fetch JSON data")
         return
 
-    debug_dir = "debug_slides_output"
+    debug_dir = "final_verification_output"
+    # ... rest of the main remains similar but uses debug_dir
     total_duration = float(json_data.get('duration', 0))
     print(f"Total duration: {total_duration:.2f}s ({format_time_readable(total_duration)})")
 
