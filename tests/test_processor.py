@@ -610,6 +610,41 @@ def test_parse_presentation_timeline_uses_single_slide_payload_as_current_slide(
     assert slides == ["s1.jpg", "s2.jpg", "s3.jpg"]
 
 
+def test_parse_event_logs_truncates_clip_on_deletion_event():
+    json_data = {
+        "eventLogs": [
+            {
+                "module": "mediasession.add",
+                "relativeTime": 10.0,
+                "data": {
+                    "url": "screen.mp4",
+                    "stream": {
+                        "id": 123,
+                        "screensharing": {"id": 456}
+                    }
+                }
+            },
+            {
+                "module": "screensharing.stream.delete",
+                "relativeTime": 50.0,
+                "data": {
+                    "id": 123,
+                    "screensharing": {"id": 456}
+                }
+            }
+        ]
+    }
+
+    streams, _ = parse_event_logs(json_data)
+    
+    sk = (456, True)
+    assert sk in streams
+    assert len(streams[sk]["clips"]) == 1
+    clip = streams[sk]["clips"][0]
+    assert clip["relative_time"] == 10.0
+    assert clip["duration"] == 40.0
+
+
 def test_source_switch_diagnostics_warns_when_presentation_and_screenshare_overlap(caplog):
     streams = {
         ("screen", True): {

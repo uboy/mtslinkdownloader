@@ -467,53 +467,92 @@ def parse_event_logs(json_data: dict) -> Tuple[dict, Optional[int]]:
             if conf_id is not None and not (isinstance(conf_id, str) and not conf_id.strip()):
                 user = d.get('user', {})
                 conf_meta[conf_id] = {'has_video': d.get('hasVideo', False), 'has_audio': d.get('hasAudio', False), 'user_id': user.get('id'), 'user_name': user.get('nickname', ''), 'participation_id': d.get('participationId')}
+    
     streams = {}
+    stream_id_to_sk = {}  # stream.id -> sk
+
     for event in event_logs:
-        if event.get('module') != 'mediasession.add': continue
+        module = event.get('module', '')
+        rel_time = event.get('relativeTime', 0)
         data = event.get('data', {})
-        if not isinstance(data, dict) or 'url' not in data: continue
-        stream_data = data.get('stream', {}); rel_time = event.get('relativeTime', 0); url = data['url']
-        is_screenshare = 'screensharing' in stream_data
-        if not is_screenshare:
-            s_type, s_name = str(stream_data.get('type', '')).lower(), str(stream_data.get('name', '')).lower()
-            for k in ('screen', 'presentation', 'desktop'):
-                if k in s_type or k in s_name: is_screenshare = True; break
-        conference = stream_data.get('conference', {})
-        if not isinstance(conference, dict):
-            conference = {}
-        s_info = stream_data.get('screensharing', {}) if is_screenshare else {}
-        if not isinstance(s_info, dict):
-            s_info = {}
-        if is_screenshare:
-            conf_id = s_info.get('id') or conference.get('id')
-        else:
-            conf_id = conference.get('id')
-        if conf_id is None or (isinstance(conf_id, str) and not conf_id.strip()):
-            fallback_conf_id = (
-                conference.get('participationId')
-                or s_info.get('participationId')
-                or s_info.get('streamId')
-                or stream_data.get('id')
-                or data.get('id')
-                or data.get('participationId')
-                or f'url:{url}'
-            )
-            conf_id = f'fallback:{fallback_conf_id}'
-        sk = (conf_id, is_screenshare)
-        if sk not in streams:
-            meta = conf_meta.get(sk[0], {})
-            if not meta and conference.get('id') is not None:
-                meta = conf_meta.get(conference.get('id'), {})
-            conf_user = conference.get('user', {}) if isinstance(conference.get('user'), dict) else {}
-            user_id = meta.get('user_id') if meta.get('user_id') is not None else conf_user.get('id')
-            user_name = meta.get('user_name') or conf_user.get('nickname', '')
-            is_admin = (
-                user_id is not None
-                and admin_user_id is not None
-                and str(user_id) == str(admin_user_id)
-            )
-            streams[sk] = {'conference_id': sk[0], 'is_screenshare': is_screenshare, 'user_id': user_id, 'user_name': user_name, 'conf_has_video': meta.get('has_video', False), 'conf_has_audio': meta.get('has_audio', False), 'is_admin': is_admin, 'clips': []}
-        streams[sk]['clips'].append({'url': url, 'relative_time': rel_time, 'file_path': None, 'duration': 0, 'width': 0, 'height': 0, 'has_video': False, 'has_audio': False})
+        if not isinstance(data, dict): continue
+
+        if module == 'mediasession.add':
+            if 'url' not in data: continue
+            stream_data = data.get('stream', {}); url = data['url']
+            stream_id = stream_data.get('id')
+            is_screenshare = 'screensharing' in stream_data
+            if not is_screenshare:
+                s_type, s_name = str(stream_data.get('type', '')).lower(), str(stream_data.get('name', '')).lower()
+                for k in ('screen', 'presentation', 'desktop'):
+                    if k in s_type or k in s_name: is_screenshare = True; break
+            
+            conference = stream_data.get('conference', {})
+            if not isinstance(conference, dict): conference = {}
+            s_info = stream_data.get('screensharing', {}) if is_screenshare else {}
+            if not isinstance(s_info, dict): s_info = {}
+            
+            if is_screenshare:
+                conf_id = s_info.get('id') or conference.get('id')
+            else:
+                conf_id = conference.get('id')
+            
+            if conf_id is None or (isinstance(conf_id, str) and not conf_id.strip()):
+                fallback_conf_id = (
+                    conference.get('participationId')
+                    or s_info.get('participationId')
+                    or s_info.get('streamId')
+                    or stream_data.get('id')
+                    or data.get('id')
+                    or data.get('participationId')
+                    or f'url:{url}'
+                )
+                conf_id = f'fallback:{fallback_conf_id}'
+            
+            sk = (conf_id, is_screenshare)
+            if stream_id:
+                stream_id_to_sk[stream_id] = sk
+
+            if sk not in streams:
+                meta = conf_meta.get(sk[0], {})
+                if not meta and conference.get('id') is not None:
+                    meta = conf_meta.get(conference.get('id'), {})
+                conf_user = conference.get('user', {}) if isinstance(conference.get('user'), dict) else {}
+                user_id = meta.get('user_id') if meta.get('user_id') is not None else conf_user.get('id')
+                user_name = meta.get('user_name') or conf_user.get('nickname', '')
+                is_admin = (
+                    user_id is not None
+                    and admin_user_id is not None
+                    and str(user_id) == str(admin_user_id)
+                )
+                streams[sk] = {'conference_id': sk[0], 'is_screenshare': is_screenshare, 'user_id': user_id, 'user_name': user_name, 'conf_has_video': meta.get('has_video', False), 'conf_has_audio': meta.get('has_audio', False), 'is_admin': is_admin, 'clips': []}
+            
+            # Truncate previous clip in this stream if it hasn't ended
+            if streams[sk]['clips']:
+                prev = streams[sk]['clips'][-1]
+                if prev['duration'] == 0:
+                    prev['duration'] = max(0, rel_time - prev['relative_time'])
+            
+            streams[sk]['clips'].append({'url': url, 'relative_time': rel_time, 'file_path': None, 'duration': 0, 'width': 0, 'height': 0, 'has_video': False, 'has_audio': False, 'stream_id': stream_id})
+
+        elif module in ('conference.stream.delete', 'screensharing.stream.delete'):
+            stream_id = data.get('id')
+            if stream_id and stream_id in stream_id_to_sk:
+                sk = stream_id_to_sk[stream_id]
+                if streams[sk]['clips']:
+                    prev = streams[sk]['clips'][-1]
+                    if prev['duration'] == 0:
+                        prev['duration'] = max(0, rel_time - prev['relative_time'])
+        
+        elif module in ('conference.update', 'screensharing.update') and data.get('isDeleted'):
+            conf_id = data.get('id')
+            is_screenshare = (module == 'screensharing.update')
+            sk = (conf_id, is_screenshare)
+            if sk in streams and streams[sk]['clips']:
+                prev = streams[sk]['clips'][-1]
+                if prev['duration'] == 0:
+                    prev['duration'] = max(0, rel_time - prev['relative_time'])
+
     for s in streams.values(): s['clips'].sort(key=lambda c: c['relative_time'])
     return streams, admin_user_id
 
