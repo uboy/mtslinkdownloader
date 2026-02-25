@@ -26,12 +26,15 @@ def get_logs_path():
     return os.path.join(logs_dir, 'mtslinkdownloader.log')
 
 
-def initialize_logger(force: bool = False, stream=None, level: str = "INFO"):
+def initialize_logger(force: bool = False, stream=None, level: str = "INFO", log_file_path: str = None):
     root_logger = logging.getLogger()
     if root_logger.handlers and not force:
         return
 
-    log_file = get_logs_path()
+    log_file = log_file_path or get_logs_path()
+    log_dir = os.path.dirname(log_file)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
     logging.basicConfig(
         level=normalize_log_level(level),
         format='%(asctime)s [%(levelname)s]: %(message)s',

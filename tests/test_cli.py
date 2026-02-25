@@ -48,6 +48,8 @@ def test_main_returns_error_for_invalid_url(monkeypatch):
             max_duration=None,
             start_time=0,
             quality="1080p",
+            log_file=None,
+            status_file=None,
         ),
     )
     monkeypatch.setattr(
@@ -73,6 +75,8 @@ def test_main_returns_zero_and_forwards_args(monkeypatch):
             max_duration=120.0,
             start_time=30.0,
             quality="720p",
+            log_file="custom.log",
+            status_file="status.json",
         ),
     )
 
@@ -91,6 +95,7 @@ def test_main_returns_zero_and_forwards_args(monkeypatch):
         "max_duration": 120.0,
         "start_time": 30.0,
         "quality": "720p",
+        "status_file": "status.json",
     }
 
 
@@ -106,6 +111,8 @@ def test_main_returns_error_when_fetch_fails(monkeypatch):
             max_duration=None,
             start_time=0,
             quality="1080p",
+            log_file=None,
+            status_file=None,
         ),
     )
     monkeypatch.setattr(cli, "fetch_webinar_data", lambda **_: None)
@@ -127,15 +134,19 @@ def test_main_initializes_logger_with_selected_level(monkeypatch):
             max_duration=None,
             start_time=0,
             quality="1080p",
+            log_file="run.log",
+            status_file="run-status.json",
         ),
     )
 
-    def fake_initialize_logger(force=False, level="INFO"):
+    def fake_initialize_logger(force=False, level="INFO", log_file_path=None):
         calls["force"] = force
         calls["level"] = level
+        calls["log_file_path"] = log_file_path
 
     monkeypatch.setattr(cli, "initialize_logger", fake_initialize_logger)
+    monkeypatch.setattr(cli, "get_logs_path", lambda: "default.log")
     monkeypatch.setattr(cli, "fetch_webinar_data", lambda **_: 1)
 
     assert cli.main() == 0
-    assert calls == {"force": False, "level": "ERROR"}
+    assert calls == {"force": False, "level": "ERROR", "log_file_path": "run.log"}

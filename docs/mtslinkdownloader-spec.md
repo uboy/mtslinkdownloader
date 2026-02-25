@@ -29,7 +29,8 @@
 3. Load JSON metadata (`eventLogs`, `duration`, record name).
 4. Parse streams from event logs:
    - detect camera vs screenshare streams
-   - detect admin stream for priority
+   - detect admin user id (`eventsession.start`) as a weak tie-break signal
+   - build stream key as `(conference_id, is_screenshare)` with fallback id (`fallback:<...>`) when `conference_id` is missing
 5. Download media chunks concurrently.
 6. Probe each chunk with `ffprobe`:
    - duration, video/audio presence, dimensions
@@ -43,6 +44,16 @@
     - Mode B: camera grid layout
     - mix audio from active tracks
 11. Concatenate segment files into final MP4.
+
+### 4.1 Primary Visual Source Selection
+
+Per segment, the main visual source is selected as follows:
+- if active screenshare clip has video, render screenshare on the main canvas;
+- otherwise, use slide image from `presentation.*` timeline (if available);
+- if neither is available, render black background on main canvas.
+
+When multiple screenshares are active, selection is deterministic and uses media signals first
+(`has_video`, frame area, audio, clip start time). Lecturer/admin affinity is only a tie-break.
 
 ## 5. Output
 
@@ -61,7 +72,8 @@
 
 - Requires ffmpeg-compatible environment for rendering.
 - Input URL must be from `mts-link.ru` domain format.
-- No automated tests currently present in the repository.
+- Presentation and screenshare overlap is inferred heuristically from event logs; explicit stage-switch events may be absent.
+- ADMIN role metadata can be stale/incomplete; it is treated as heuristic, not source-of-truth for visible source.
 
 ## 8. Refactoring and Rename Scope
 

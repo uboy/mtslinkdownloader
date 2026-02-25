@@ -9,7 +9,7 @@ DOWNLOAD_TIMEOUT_SETTINGS = httpx.Timeout(300.0, connect=15.0)
 CONNECTION_LIMITS = httpx.Limits(max_connections=10, max_keepalive_connections=8)
 
 
-def construct_json_data_url(event_session_id: str, recording_id: str) -> str:
+def construct_json_data_url(event_session_id: str, recording_id: Optional[str]) -> str:
     if not event_session_id:
         raise ValueError('Missing webinar event session ID.')
     

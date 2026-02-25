@@ -1,9 +1,10 @@
 import argparse
 import logging
+import os
 import re
 from typing import Optional, Tuple
 
-from .utils import initialize_logger
+from .utils import get_logs_path, initialize_logger
 from .webinar import fetch_webinar_data
 
 URL_PATTERN = re.compile(
@@ -57,6 +58,16 @@ def parse_arguments():
         default='1080p',
         help='Output video quality (resolution). Default is 1080p.'
     )
+    parser.add_argument(
+        '--log-file',
+        default=None,
+        help='Write logs to this file in addition to console output.'
+    )
+    parser.add_argument(
+        '--status-file',
+        default=None,
+        help='Write machine-readable processing status (JSON) to this file.'
+    )
     return parser.parse_args()
 
 
@@ -71,9 +82,13 @@ def extract_ids_from_url(url: str) -> Tuple[Optional[str], Optional[str]]:
 
 def main():
     args = parse_arguments()
-    initialize_logger(force=False, level=args.log_level)
+    log_file_path = args.log_file or get_logs_path()
+    initialize_logger(force=False, level=args.log_level, log_file_path=log_file_path)
     # Silence httpx logs to keep progress bars readable
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.info('Log file: %s', os.path.abspath(log_file_path))
+    if args.status_file:
+        logging.info('Status file: %s', os.path.abspath(args.status_file))
 
     event_sessions, record_id = extract_ids_from_url(args.url)
     if event_sessions is None:
@@ -89,7 +104,8 @@ def main():
             hide_silent=args.hide_silent,
             max_duration=args.max_duration,
             start_time=args.start_time,
-            quality=args.quality
+            quality=args.quality,
+            status_file=args.status_file,
         ):
             logging.info('Download completed.')
             return 0

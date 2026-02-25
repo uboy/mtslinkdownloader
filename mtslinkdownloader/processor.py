@@ -13,7 +13,7 @@ from bisect import bisect_right
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import shutil
 import tqdm
@@ -168,11 +168,12 @@ def _choose_primary_screenshare(active: list, streams: dict, admin_user_id: Opti
         area = width * height
         clip_start = float(clip.get('relative_time') or 0.0)
         return (
-            1 if _is_lecturer_stream(stream, admin_user_id) else 0,
             1 if clip.get('has_video') else 0,
             area,
-            clip_start,
             1 if clip.get('has_audio') else 0,
+            clip_start,
+            1 if _is_lecturer_stream(stream, admin_user_id) else 0,
+            str(sk),
         )
 
     return max(screenshares, key=_score)
@@ -269,6 +270,21 @@ def _format_elapsed(seconds: float) -> str:
     h, rem = divmod(total, 3600)
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _write_status_file(status_file: Optional[str], payload: dict):
+    if not status_file:
+        return
+    try:
+        directory = os.path.dirname(status_file)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp_path = status_file + '.tmp'
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, status_file)
+    except Exception as exc:
+        logging.warning('Failed to write status file %s: %s', status_file, exc)
 
 
 def _extract_text_value(data: dict) -> Optional[str]:
@@ -448,7 +464,7 @@ def parse_event_logs(json_data: dict) -> Tuple[dict, Optional[int]]:
     for event in event_logs:
         if event.get('module') == 'conference.add':
             d = event.get('data', {}); conf_id = d.get('id')
-            if conf_id:
+            if conf_id is not None and not (isinstance(conf_id, str) and not conf_id.strip()):
                 user = d.get('user', {})
                 conf_meta[conf_id] = {'has_video': d.get('hasVideo', False), 'has_audio': d.get('hasAudio', False), 'user_id': user.get('id'), 'user_name': user.get('nickname', ''), 'participation_id': d.get('participationId')}
     streams = {}
@@ -462,13 +478,41 @@ def parse_event_logs(json_data: dict) -> Tuple[dict, Optional[int]]:
             s_type, s_name = str(stream_data.get('type', '')).lower(), str(stream_data.get('name', '')).lower()
             for k in ('screen', 'presentation', 'desktop'):
                 if k in s_type or k in s_name: is_screenshare = True; break
+        conference = stream_data.get('conference', {})
+        if not isinstance(conference, dict):
+            conference = {}
+        s_info = stream_data.get('screensharing', {}) if is_screenshare else {}
+        if not isinstance(s_info, dict):
+            s_info = {}
         if is_screenshare:
-            s_info = stream_data.get('screensharing', {}); conf_id = s_info.get('id') or stream_data.get('conference', {}).get('id')
-            sk = (conf_id, True)
-        else: sk = (stream_data.get('conference', {}).get('id'), False)
+            conf_id = s_info.get('id') or conference.get('id')
+        else:
+            conf_id = conference.get('id')
+        if conf_id is None or (isinstance(conf_id, str) and not conf_id.strip()):
+            fallback_conf_id = (
+                conference.get('participationId')
+                or s_info.get('participationId')
+                or s_info.get('streamId')
+                or stream_data.get('id')
+                or data.get('id')
+                or data.get('participationId')
+                or f'url:{url}'
+            )
+            conf_id = f'fallback:{fallback_conf_id}'
+        sk = (conf_id, is_screenshare)
         if sk not in streams:
-            meta = conf_meta.get(sk[0], {}); user_id = meta.get('user_id')
-            streams[sk] = {'conference_id': sk[0], 'is_screenshare': is_screenshare, 'user_id': user_id, 'user_name': meta.get('user_name', ''), 'conf_has_video': meta.get('has_video', False), 'conf_has_audio': meta.get('has_audio', False), 'is_admin': user_id == admin_user_id if user_id and admin_user_id else False, 'clips': []}
+            meta = conf_meta.get(sk[0], {})
+            if not meta and conference.get('id') is not None:
+                meta = conf_meta.get(conference.get('id'), {})
+            conf_user = conference.get('user', {}) if isinstance(conference.get('user'), dict) else {}
+            user_id = meta.get('user_id') if meta.get('user_id') is not None else conf_user.get('id')
+            user_name = meta.get('user_name') or conf_user.get('nickname', '')
+            is_admin = (
+                user_id is not None
+                and admin_user_id is not None
+                and str(user_id) == str(admin_user_id)
+            )
+            streams[sk] = {'conference_id': sk[0], 'is_screenshare': is_screenshare, 'user_id': user_id, 'user_name': user_name, 'conf_has_video': meta.get('has_video', False), 'conf_has_audio': meta.get('has_audio', False), 'is_admin': is_admin, 'clips': []}
         streams[sk]['clips'].append({'url': url, 'relative_time': rel_time, 'file_path': None, 'duration': 0, 'width': 0, 'height': 0, 'has_video': False, 'has_audio': False})
     for s in streams.values(): s['clips'].sort(key=lambda c: c['relative_time'])
     return streams, admin_user_id
@@ -617,7 +661,7 @@ def _download_and_probe_clip(clip: dict, directory: str, client) -> Optional[str
         clip['speech_intervals'] = _detect_speech_intervals(file_path, clip['duration'])
     return None
 
-def download_and_probe_all(streams: dict, directory: str, max_workers: int = None):
+def download_and_probe_all(streams: dict, directory: str, max_workers: int = None, progress_callback: Optional[Callable[[int, int], None]] = None):
     global STOP_REQUESTED
     max_workers = max_workers or min(os.cpu_count() or 4, 48)
     all_clips = [c for s in streams.values() for c in s['clips']]
@@ -634,6 +678,8 @@ def download_and_probe_all(streams: dict, directory: str, max_workers: int = Non
                     res = f.result()
                     if res: reports.append(res)
                     pbar.update(1)
+                    if progress_callback:
+                        progress_callback(pbar.n, len(all_clips))
             finally: executor.shutdown(wait=True)
     if STOP_REQUESTED: raise RuntimeError("interrupted")
     for r in reports: logging.info(f'  {r}')
@@ -691,7 +737,15 @@ def compute_layout_timeline(streams: dict, total_duration: float, admin_user_id:
                 cameras = [lecturer] + cameras
         if not preserve_speaking_order:
             cameras.sort(key=lambda c: (0 if _is_lecturer_stream(streams[c[0]], admin_user_id) else 1, streams[c[0]].get('user_name', '').lower()))
-        slide = next((path for s_s, s_e, path in (slide_timeline or []) if s_s <= t_probe < s_e), None) if not screenshare else None
+        slide = next((path for s_s, s_e, path in (slide_timeline or []) if s_s <= t_probe < s_e), None)
+        screenshare_has_visual = bool(screenshare and screenshare[1].get('has_video'))
+        if screenshare and slide:
+            if screenshare_has_visual:
+                slide = None
+            else:
+                screenshare = None
+        elif screenshare and not screenshare_has_visual:
+            screenshare = None
         chat_version = bisect_right(event_times, t_probe)
         segments.append({'start': t_s, 'end': t_e, 'screenshare': screenshare, 'cameras': cameras, 'audio_sources': audio_sources, 'slide_image': slide, 'chat_version': chat_version})
     if not segments: return []
@@ -852,7 +906,7 @@ def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str,
     _run_ffmpeg(cmd, desc=f'seg {seg_index}', timeout=max(120, int(60+duration*30)))
     return output_path
 
-def render_all_segments(timeline: list, streams: dict, tmpdir: str, out_w: int = 1920, out_h: int = 1080, events: list = None, process_started_ts: Optional[float] = None) -> list:
+def render_all_segments(timeline: list, streams: dict, tmpdir: str, out_w: int = 1920, out_h: int = 1080, events: list = None, process_started_ts: Optional[float] = None, progress_callback: Optional[Callable[[int, int], None]] = None) -> list:
     global STOP_REQUESTED
     encoder, preset, max_workers = _detect_best_encoder(); cpu_count = os.cpu_count() or 4
     threads_per_worker = max(1, min(4, cpu_count // max_workers)); segment_files = [None] * len(timeline)
@@ -884,6 +938,8 @@ def render_all_segments(timeline: list, streams: dict, tmpdir: str, out_w: int =
                         executor.shutdown(wait=False, cancel_futures=True); raise
                     pbar.update(1)
                     completed += 1
+                    if progress_callback:
+                        progress_callback(completed, len(timeline))
                     if completed % 10 == 0 or completed == len(timeline):
                         render_elapsed = _format_elapsed(time.perf_counter() - render_started_ts)
                         if process_started_ts is not None:
@@ -1031,60 +1087,123 @@ def _log_source_switch_diagnostics(
         )
 
 
-def process_composite_video(directory: str, json_data: dict, output_path: str, max_duration=None, hide_silent: bool = False, start_time: float = 0, quality: str = "1080p"):
+def process_composite_video(directory: str, json_data: dict, output_path: str, max_duration=None, hide_silent: bool = False, start_time: float = 0, quality: str = "1080p", status_file: Optional[str] = None):
     global STOP_REQUESTED
     STOP_REQUESTED = False 
     process_started_ts = time.perf_counter()
     process_started_at = datetime.datetime.now()
+    status_payload = {
+        'state': 'running',
+        'stage': 'initializing',
+        'started_at': process_started_at.isoformat(timespec='seconds'),
+        'updated_at': process_started_at.isoformat(timespec='seconds'),
+        'output_path': os.path.abspath(output_path),
+        'start_time_sec': float(start_time),
+    }
+
+    def _update_status(state: Optional[str] = None, stage: Optional[str] = None, progress: Optional[dict] = None, message: Optional[str] = None):
+        if state:
+            status_payload['state'] = state
+        if stage:
+            status_payload['stage'] = stage
+        if progress is not None:
+            status_payload['progress'] = progress
+        if message is not None:
+            status_payload['message'] = message
+        status_payload['updated_at'] = datetime.datetime.now().isoformat(timespec='seconds')
+        status_payload['elapsed'] = _format_elapsed(time.perf_counter() - process_started_ts)
+        _write_status_file(status_file, status_payload)
+
+    _update_status(stage='initializing')
     logging.info(f'Process started at {process_started_at.strftime("%Y-%m-%d %H:%M:%S")}')
-    out_w, out_h = _resolve_output_resolution(quality)
-    total_duration = _resolve_total_duration(json_data, max_duration, start_time)
-    logging.info(f'Target timeline: start={start_time:.1f}s, end={total_duration:.1f}s, duration={max(0.0, total_duration-start_time):.1f}s')
-    chat, questions = parse_chat_and_questions(json_data)
-    all_events = sorted(chat + questions, key=lambda x: x['time'])
-    export_chat_files(chat, questions, directory, os.path.basename(output_path).replace('.mp4', ''))
-    streams, admin_id = parse_event_logs(json_data)
-    if not streams: return
-    _prepare_stream_clip_flags(streams, hide_silent)
-    download_and_probe_all(streams, directory)
-    logging.info(f'Files processed | elapsed {_format_elapsed(time.perf_counter() - process_started_ts)}')
-    _reclassify_screenshare_by_dimensions(streams)
-    slides, s_timeline = parse_presentation_timeline(json_data)
-    _log_source_switch_diagnostics(json_data, streams, s_timeline, start_time, total_duration)
-    if slides:
-        s_timeline = _materialize_slide_timeline(directory, slides, s_timeline)
-    missing_slide_images = sum(1 for _, _, path in s_timeline if not os.path.exists(path)) if s_timeline else 0
-    if missing_slide_images:
-        logging.warning('Slide timeline contains %d missing local slide images; these intervals may render as black.', missing_slide_images)
-    if STOP_REQUESTED: raise RuntimeError("interrupted")
-    speech_timelines = {sk: _build_stream_speech_timeline(s) for sk, s in streams.items() if not s['is_screenshare']} if hide_silent else {}
-    timeline = compute_layout_timeline(streams, total_duration, admin_id, hide_silent, speech_timelines, start_time, s_timeline, all_events)
-    if not timeline: return
-    logging.info(f'Timeline ready: {len(timeline)} segments | elapsed {_format_elapsed(time.perf_counter() - process_started_ts)}')
-    if logging.getLogger().isEnabledFor(logging.DEBUG):
-        for i, segment in enumerate(timeline[:20]):
-            main_source = 'screen' if segment.get('screenshare') else ('slide' if segment.get('slide_image') else 'none')
-            logging.debug(
-                'seg[%d] %.2f-%.2f source=%s cameras=%d audio=%d chat=%d',
-                i,
-                segment['start'],
-                segment['end'],
-                main_source,
-                len(segment.get('cameras', [])),
-                len(segment.get('audio_sources', [])),
-                segment.get('chat_version', 0),
+    try:
+        out_w, out_h = _resolve_output_resolution(quality)
+        total_duration = _resolve_total_duration(json_data, max_duration, start_time)
+        _update_status(stage='preparing', progress={'current': 0, 'total': 1, 'unit': 'step'})
+        logging.info(f'Target timeline: start={start_time:.1f}s, end={total_duration:.1f}s, duration={max(0.0, total_duration-start_time):.1f}s')
+        chat, questions = parse_chat_and_questions(json_data)
+        all_events = sorted(chat + questions, key=lambda x: x['time'])
+        export_chat_files(chat, questions, directory, os.path.basename(output_path).replace('.mp4', ''))
+        streams, admin_id = parse_event_logs(json_data)
+        if not streams:
+            _update_status(state='completed', stage='done', message='No media streams found.')
+            return
+        _prepare_stream_clip_flags(streams, hide_silent)
+
+        _update_status(stage='downloading', progress={'current': 0, 'total': sum(len(s['clips']) for s in streams.values()), 'unit': 'file'})
+
+        def _on_download_progress(current: int, total: int):
+            if current == total or current % 20 == 0:
+                _update_status(stage='downloading', progress={'current': current, 'total': total, 'unit': 'file'})
+
+        download_and_probe_all(streams, directory, progress_callback=_on_download_progress)
+        logging.info(f'Files processed | elapsed {_format_elapsed(time.perf_counter() - process_started_ts)}')
+        _reclassify_screenshare_by_dimensions(streams)
+        slides, s_timeline = parse_presentation_timeline(json_data)
+        _log_source_switch_diagnostics(json_data, streams, s_timeline, start_time, total_duration)
+        if slides:
+            _update_status(stage='slides', progress={'current': 0, 'total': len(slides), 'unit': 'slide'})
+            s_timeline = _materialize_slide_timeline(directory, slides, s_timeline)
+            _update_status(stage='slides', progress={'current': len(slides), 'total': len(slides), 'unit': 'slide'})
+        missing_slide_images = sum(1 for _, _, path in s_timeline if not os.path.exists(path)) if s_timeline else 0
+        if missing_slide_images:
+            logging.warning('Slide timeline contains %d missing local slide images; these intervals may render as black.', missing_slide_images)
+        if STOP_REQUESTED:
+            raise RuntimeError("interrupted")
+        speech_timelines = {sk: _build_stream_speech_timeline(s) for sk, s in streams.items() if not s['is_screenshare']} if hide_silent else {}
+        timeline = compute_layout_timeline(streams, total_duration, admin_id, hide_silent, speech_timelines, start_time, s_timeline, all_events)
+        if not timeline:
+            _update_status(state='completed', stage='done', message='No timeline segments to render.')
+            return
+        _update_status(stage='timeline', progress={'current': len(timeline), 'total': len(timeline), 'unit': 'segment'})
+        logging.info(f'Timeline ready: {len(timeline)} segments | elapsed {_format_elapsed(time.perf_counter() - process_started_ts)}')
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            for i, segment in enumerate(timeline[:20]):
+                main_source = 'screen' if segment.get('screenshare') else ('slide' if segment.get('slide_image') else 'none')
+                logging.debug(
+                    'seg[%d] %.2f-%.2f source=%s cameras=%d audio=%d chat=%d',
+                    i,
+                    segment['start'],
+                    segment['end'],
+                    main_source,
+                    len(segment.get('cameras', [])),
+                    len(segment.get('audio_sources', [])),
+                    segment.get('chat_version', 0),
+                )
+            if len(timeline) > 20:
+                logging.debug('... %d more segments omitted from debug output', len(timeline) - 20)
+        if hide_silent:
+            active = {streams[sk]['user_name'] for sk, t in speech_timelines.items() if t}
+            logging.info(f'Active participants (with speech): {len(active)}')
+
+        _update_status(stage='rendering', progress={'current': 0, 'total': len(timeline), 'unit': 'segment'})
+
+        def _on_render_progress(current: int, total: int):
+            if current == total or current % 10 == 0:
+                _update_status(stage='rendering', progress={'current': current, 'total': total, 'unit': 'segment'})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            files = render_all_segments(
+                timeline,
+                streams,
+                tmp,
+                out_w,
+                out_h,
+                events=all_events,
+                process_started_ts=process_started_ts,
+                progress_callback=_on_render_progress,
             )
-        if len(timeline) > 20:
-            logging.debug('... %d more segments omitted from debug output', len(timeline) - 20)
-    if hide_silent:
-        active = {streams[sk]['user_name'] for sk, t in speech_timelines.items() if t}
-        logging.info(f'Active participants (with speech): {len(active)}')
-    with tempfile.TemporaryDirectory() as tmp:
-        files = render_all_segments(timeline, streams, tmp, out_w, out_h, events=all_events, process_started_ts=process_started_ts)
-        if files: concat_segments(files, output_path)
-    logging.info(f'Done: {output_path}')
-    process_finished_at = datetime.datetime.now()
-    logging.info(f'Process finished at {process_finished_at.strftime("%Y-%m-%d %H:%M:%S")} | total elapsed {_format_elapsed(time.perf_counter() - process_started_ts)}')
+            if files:
+                _update_status(stage='concatenating')
+                concat_segments(files, output_path)
+        logging.info(f'Done: {output_path}')
+        process_finished_at = datetime.datetime.now()
+        _update_status(state='completed', stage='done', progress={'current': 1, 'total': 1, 'unit': 'job'})
+        logging.info(f'Process finished at {process_finished_at.strftime("%Y-%m-%d %H:%M:%S")} | total elapsed {_format_elapsed(time.perf_counter() - process_started_ts)}')
+    except Exception as exc:
+        final_state = 'interrupted' if 'interrupted' in str(exc).lower() else 'failed'
+        _update_status(state=final_state, stage='error', message=str(exc))
+        raise
 
 def process_video_clips(directory: str, json_data: Dict, max_workers: int = 16) -> Tuple[float, List[dict], List[dict]]:
     total_duration = float(json_data.get('duration', 0))

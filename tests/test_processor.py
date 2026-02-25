@@ -11,6 +11,7 @@ from mtslinkdownloader.processor import (
     _format_elapsed,
     _resolve_total_duration,
     parse_chat_and_questions,
+    parse_event_logs,
     parse_presentation_timeline,
 )
 
@@ -114,6 +115,107 @@ def test_compute_layout_prefers_lecturer_screenshare_when_multiple_active():
     assert screenshare is not None
     assert screenshare[0] == lecturer_screen_key
 
+
+def test_compute_layout_uses_slide_when_screenshare_has_no_video():
+    share_key = ("screen", True)
+    streams = {
+        share_key: _make_stream(is_admin=False, is_screenshare=True, user_id=100, user_name="Screen"),
+    }
+    streams[share_key]["clips"].append(
+        _make_clip(start=0.0, duration=10.0, has_video=False, has_audio=True, file_path="screen.mp4")
+    )
+
+    timeline = compute_layout_timeline(
+        streams=streams,
+        total_duration=10.0,
+        admin_user_id=None,
+        start_time=0.0,
+        slide_timeline=[(0.0, 10.0, "slide.jpg")],
+    )
+
+    assert len(timeline) == 1
+    assert timeline[0]["screenshare"] is None
+    assert timeline[0]["slide_image"] == "slide.jpg"
+
+
+def test_parse_event_logs_uses_fallback_stream_keys_when_conference_id_missing():
+    json_data = {
+        "eventLogs": [
+            {
+                "module": "mediasession.add",
+                "relativeTime": 0.0,
+                "data": {"url": "camera_a.mp4", "stream": {"conference": {}}},
+            },
+            {
+                "module": "mediasession.add",
+                "relativeTime": 0.1,
+                "data": {"url": "camera_b.mp4", "stream": {"conference": {}}},
+            },
+        ]
+    }
+
+    streams, _ = parse_event_logs(json_data)
+
+    assert len(streams) == 2
+    keys = sorted(streams.keys())
+    assert all(str(k[0]).startswith("fallback:") for k in keys)
+    assert sorted(
+        clip["url"]
+        for stream in streams.values()
+        for clip in stream["clips"]
+    ) == ["camera_a.mp4", "camera_b.mp4"]
+
+
+def test_parse_event_logs_marks_admin_by_snapshot_id_not_nickname():
+    json_data = {
+        "eventLogs": [
+            {
+                "module": "eventsession.start",
+                "snapshot": {
+                    "data": {
+                        "userlist": [
+                            {"role": "ADMIN", "user": {"id": 1}},
+                            {"role": "USER", "user": {"id": 2}},
+                        ]
+                    }
+                },
+            },
+            {
+                "module": "conference.add",
+                "data": {
+                    "id": "conf-admin",
+                    "hasVideo": True,
+                    "hasAudio": True,
+                    "user": {"id": 1, "nickname": "Lecturer"},
+                },
+            },
+            {
+                "module": "conference.add",
+                "data": {
+                    "id": "conf-user",
+                    "hasVideo": True,
+                    "hasAudio": True,
+                    "user": {"id": 2, "nickname": "ADMIN"},
+                },
+            },
+            {
+                "module": "mediasession.add",
+                "relativeTime": 0.0,
+                "data": {"url": "lecturer.mp4", "stream": {"conference": {"id": "conf-admin"}}},
+            },
+            {
+                "module": "mediasession.add",
+                "relativeTime": 0.0,
+                "data": {"url": "participant.mp4", "stream": {"conference": {"id": "conf-user"}}},
+            },
+        ]
+    }
+
+    streams, admin_user_id = parse_event_logs(json_data)
+
+    assert admin_user_id == 1
+    assert streams[("conf-admin", False)]["is_admin"] is True
+    assert streams[("conf-user", False)]["is_admin"] is False
 
 def test_build_chat_overlay_text_uses_latest_messages_only():
     events = [
