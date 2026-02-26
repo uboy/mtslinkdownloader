@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import math
@@ -1057,10 +1058,11 @@ def _download_slide_images(directory: str, slide_urls: List[str]) -> Dict[str, s
         return slide_map
 
     with create_shared_client() as client:
-        for i, url in enumerate(slide_urls):
+        for url in slide_urls:
             if STOP_REQUESTED:
                 break
-            path = os.path.join(directory, f'slide_{i:03d}.jpg')
+            url_hash = hashlib.md5(url.encode()).hexdigest()[:16]
+            path = os.path.join(directory, f'slide_{url_hash}.jpg')
             if not os.path.exists(path):
                 try:
                     response = client.get(url)
