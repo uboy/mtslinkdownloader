@@ -193,12 +193,27 @@ def _speech_overlap_duration(timeline: list, start: float, end: float) -> float:
 def _create_proxy_clip(file_path: str, threads: int = 2) -> str:
     if STOP_REQUESTED: return file_path
     proxy_path = file_path.replace('.mp4', '_proxy.mp4')
-    if os.path.exists(proxy_path): return proxy_path
-    cmd = [_get_ffmpeg(), '-threads', str(threads), '-y', '-i', file_path, '-vf', 'scale=320:240:force_original_aspect_ratio=decrease,pad=320:240:(ow-iw)/2:(oh-ih)/2:black,setsar=1', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-c:a', 'copy', proxy_path]
+    if os.path.exists(proxy_path):
+        info = _probe_media(proxy_path)
+        if info['has_video']:
+            return proxy_path
+        try:
+            os.remove(proxy_path)
+        except OSError:
+            pass
+    tmp_path = proxy_path + '.tmp'
+    cmd = [_get_ffmpeg(), '-threads', str(threads), '-y', '-i', file_path, '-vf', 'scale=320:240:force_original_aspect_ratio=decrease,pad=320:240:(ow-iw)/2:(oh-ih)/2:black,setsar=1', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-c:a', 'aac', '-ar', '44100', '-ac', '2', tmp_path]
     try:
         subprocess.run(cmd, capture_output=True, check=True, timeout=300)
+        os.replace(tmp_path, proxy_path)
         return proxy_path
-    except Exception: return file_path
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        return file_path
 
 def _create_name_placeholder(name: str, directory: str, w: int, h: int) -> str:
     safe_name = name.replace("'", "").replace(":", "")
