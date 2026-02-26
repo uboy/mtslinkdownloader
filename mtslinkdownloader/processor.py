@@ -101,7 +101,7 @@ def _run_ffmpeg(args: list, desc: str = "", timeout: int = None):
                 raise RuntimeError('interrupted')
             err_msg = result.stderr[-1000:] if result.stderr else "No stderr"
             logging.error(f'FFmpeg fail ({desc}): {err_msg}')
-            raise RuntimeError(f'ffmpeg failed: {desc}')
+            raise RuntimeError(f'ffmpeg failed: {desc}: {err_msg}')
     except KeyboardInterrupt:
         request_stop()
         raise RuntimeError('interrupted')
@@ -955,6 +955,8 @@ def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str,
     filter_parts.append(f'[{curr_v}][chat]overlay={chat_x}:{chat_y}[v_fin]')
     curr_v = 'v_fin'
 
+    vf_parts = list(filter_parts)  # snapshot before audio filters
+
     if a_inputs:
         for i, idx in enumerate(a_inputs): filter_parts.append(f'[{idx}:a]asetpts=PTS-STARTPTS,aresample=44100,apad=whole_dur={duration:.3f}[a{i}]')
         filter_parts.append(f'{"".join(f"[a{i}]" for i in range(len(a_inputs)))}amix=inputs={len(a_inputs)}:duration=first:dropout_transition=0:normalize=1[aout]')
@@ -962,12 +964,25 @@ def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str,
     else: filter_parts.append(f'anullsrc=r=44100:cl=stereo:d={duration:.3f}[aout]'); a_map = '[aout]'
 
     is_min = not segment['screenshare'] and not a_inputs
-    cmd = ['-threads', str(threads), '-filter_threads', str(threads), '-y'] + inputs
-    cmd += ['-filter_complex', ';'.join(filter_parts), '-map', f'[{curr_v}]', '-map', a_map, '-c:v', encoder, '-preset', preset]
-    if is_min and encoder == 'libx264': cmd += ['-crf', '45']
-    if encoder == 'libx264': cmd += ['-tune', 'stillimage' if is_min else 'zerolatency']
-    cmd += ['-pix_fmt', 'yuv420p', '-r', str(OUTPUT_FPS), '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-t', f'{duration:.3f}', output_path]
-    _run_ffmpeg(cmd, desc=f'seg {seg_index}', timeout=max(120, int(60+duration*30)))
+
+    def _build_cmd(fp, am):
+        c = ['-threads', str(threads), '-filter_threads', str(threads), '-y'] + inputs
+        c += ['-filter_complex', ';'.join(fp), '-map', f'[{curr_v}]', '-map', am, '-c:v', encoder, '-preset', preset]
+        if is_min and encoder == 'libx264': c += ['-crf', '45']
+        if encoder == 'libx264': c += ['-tune', 'stillimage' if is_min else 'zerolatency']
+        c += ['-pix_fmt', 'yuv420p', '-r', str(OUTPUT_FPS), '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-t', f'{duration:.3f}', output_path]
+        return c
+
+    try:
+        _run_ffmpeg(_build_cmd(filter_parts, a_map), desc=f'seg {seg_index}', timeout=max(120, int(60+duration*30)))
+    except RuntimeError as e:
+        if 'interrupted' in str(e): raise
+        if a_inputs and 'matches no streams' in str(e).lower():
+            logging.warning(f'Segment {seg_index}: audio mixing failed, retrying with silence fallback')
+            silence_fp = vf_parts + [f'anullsrc=r=44100:cl=stereo:d={duration:.3f}[aout]']
+            _run_ffmpeg(_build_cmd(silence_fp, '[aout]'), desc=f'seg {seg_index} (audio fallback)', timeout=max(120, int(60+duration*30)))
+        else:
+            raise
     return output_path
 
 def render_all_segments(timeline: list, streams: dict, tmpdir: str, out_w: int = 1920, out_h: int = 1080, events: list = None, process_started_ts: Optional[float] = None, progress_callback: Optional[Callable[[int, int], None]] = None) -> list:
@@ -1064,12 +1079,16 @@ def _download_slide_images(directory: str, slide_urls: List[str]) -> Dict[str, s
             url_hash = hashlib.md5(url.encode()).hexdigest()[:16]
             path = os.path.join(directory, f'slide_{url_hash}.jpg')
             if not os.path.exists(path):
+                tmp_path = path + '.tmp'
                 try:
                     response = client.get(url)
                     response.raise_for_status()
-                    with open(path, 'wb') as file_handle:
+                    with open(tmp_path, 'wb') as file_handle:
                         file_handle.write(response.content)
+                    os.replace(tmp_path, path)
                 except Exception:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
                     continue
             slide_map[url] = path
     return slide_map

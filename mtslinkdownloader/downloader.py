@@ -83,16 +83,18 @@ def download_video_chunk(video_url: str, save_directory: str, client: Optional[h
                 )
 
         # If we get here, we need to download (or redownload)
-        with client.stream('GET', video_url) as response:
-            response.raise_for_status()
-            with open(file_path, 'wb') as file:
-                for chunk in response.iter_bytes(chunk_size=262144):
-                    file.write(chunk)
-    except Exception:
-        # Clean up partial file on failure
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        raise
+        tmp_path = file_path + '.tmp'
+        try:
+            with client.stream('GET', video_url) as response:
+                response.raise_for_status()
+                with open(tmp_path, 'wb') as file:
+                    for chunk in response.iter_bytes(chunk_size=262144):
+                        file.write(chunk)
+            os.replace(tmp_path, file_path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
     finally:
         if owns_client:
             client.close()
