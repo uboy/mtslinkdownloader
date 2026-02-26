@@ -757,7 +757,10 @@ def download_and_probe_all(streams: dict, directory: str, max_workers: int = Non
                     pbar.update(1)
                     if progress_callback:
                         progress_callback(pbar.n, len(all_clips))
-            finally: executor.shutdown(wait=True)
+            except KeyboardInterrupt:
+                request_stop()
+                raise
+            finally: executor.shutdown(wait=False)
     if STOP_REQUESTED: raise RuntimeError("interrupted")
     for r in reports: logging.info(f'  {r}')
 
@@ -953,7 +956,7 @@ def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str,
         curr_v, ov_idx = f'v{ov_idx}', ov_idx + 1
 
     chat_wrap_chars = max(20, int((chat_w - 22) / 7.3))
-    chat_max_lines = max(10, int((chat_h - 44) / 18))
+    chat_max_lines = max(4, int((chat_h - 44) / 20))
     # Use probe time (middle of segment) for chat to match timeline split logic
     t_probe = t_start + duration / 2
     chat_txt = _build_chat_overlay_text(events, t_probe, max_lines=chat_max_lines, wrap_chars=chat_wrap_chars)
@@ -1024,7 +1027,7 @@ def render_all_segments(timeline: list, streams: dict, tmpdir: str, out_w: int =
                 for f in as_completed(futures):
                     if STOP_REQUESTED: executor.shutdown(wait=False, cancel_futures=True); break
                     idx = futures[f]
-                    try: 
+                    try:
                         res = f.result()
                         if res: segment_files[idx] = res
                         else: raise RuntimeError(f"Seg {idx} fail")
@@ -1046,7 +1049,10 @@ def render_all_segments(timeline: list, streams: dict, tmpdir: str, out_w: int =
                             logging.info(f'Rendering progress: {completed}/{len(timeline)} segments | render elapsed {render_elapsed} | total elapsed {total_elapsed}')
                         else:
                             logging.info(f'Rendering progress: {completed}/{len(timeline)} segments | render elapsed {render_elapsed}')
-            finally: executor.shutdown(wait=True)
+            except KeyboardInterrupt:
+                request_stop()
+                raise
+            finally: executor.shutdown(wait=False)
     if STOP_REQUESTED: raise RuntimeError("interrupted")
     render_finished_at = datetime.datetime.now()
     logging.info(f'Rendering finished at {render_finished_at.strftime("%Y-%m-%d %H:%M:%S")} | render elapsed {_format_elapsed(time.perf_counter() - render_started_ts)}')

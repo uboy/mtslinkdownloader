@@ -59,10 +59,13 @@ def restore_terminal():
     """Ensure terminal echo and cursor are restored on Linux/macOS."""
     if os.name != 'nt': # Linux/macOS
         try:
+            # Restore all terminal settings (echo, OPOST, ICRNL, etc.)
+            os.system('stty sane')
+            # Move to a fresh line before showing cursor so it lands correctly
+            sys.stderr.write('\r\n')
+            sys.stderr.flush()
             # Send escape sequence to show cursor
             sys.stdout.write('\033[?25h')
             sys.stdout.flush()
-            # Restore echo
-            os.system('stty echo')
         except Exception:
             pass
