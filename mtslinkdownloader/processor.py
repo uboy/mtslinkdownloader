@@ -977,10 +977,15 @@ def _render_segment(seg_index: int, segment: dict, streams: dict, tmpdir: str,
         _run_ffmpeg(_build_cmd(filter_parts, a_map), desc=f'seg {seg_index}', timeout=max(120, int(60+duration*30)))
     except RuntimeError as e:
         if 'interrupted' in str(e): raise
-        if a_inputs and 'matches no streams' in str(e).lower():
-            logging.warning(f'Segment {seg_index}: audio mixing failed, retrying with silence fallback')
+        if 'matches no streams' in str(e).lower():
+            logging.warning(f'Segment {seg_index}: stream filter failed, retrying with silence')
             silence_fp = vf_parts + [f'anullsrc=r=44100:cl=stereo:d={duration:.3f}[aout]']
-            _run_ffmpeg(_build_cmd(silence_fp, '[aout]'), desc=f'seg {seg_index} (audio fallback)', timeout=max(120, int(60+duration*30)))
+            try:
+                _run_ffmpeg(_build_cmd(silence_fp, '[aout]'), desc=f'seg {seg_index} (silence)', timeout=max(120, int(60+duration*30)))
+            except RuntimeError as e2:
+                if 'interrupted' in str(e2): raise
+                logging.warning(f'Segment {seg_index}: silence fallback failed, using black frame')
+                _run_ffmpeg(['-threads', str(threads), '-y', '-f', 'lavfi', '-i', f'color=black:s={out_w}x{out_h}:r={OUTPUT_FPS}:d={duration:.3f}', '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo', '-t', f'{duration:.3f}', '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', output_path], desc=f'black {seg_index}')
         else:
             raise
     return output_path
